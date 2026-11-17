@@ -31,6 +31,7 @@ import unicodedata
 from typing import Any, Awaitable, Callable, Optional
 
 import localefmt
+import once_ledger
 import reaction_values as RV
 from io_offload import run_io  # noqa: F401 - giữ `team_runner.run_io` cho team_api và test
 import resonance_store
@@ -89,6 +90,25 @@ REPLY_ROLES = ("leader_reply", "member_reply")
 # Bước của việc nhóm chạy CÓ công cụ (0.194.0, chủ 17/10/2026: "team phải đầy đủ các quyền thì mới làm việc được"): Làm
 # và Hỗ trợ. Lượt trò chuyện, lập kế hoạch và tổng hợp vẫn chỉ chữ cho nhanh và rẻ.
 TOOL_ROLES = ("work", "help")
+# Owner, 16/11/2026: "sau mỗi lần cập nhật thì các team tự khởi động lại để tiếp tục công việc". A step that a restart
+# cut short runs again by itself. Not more than this many times for one step: a server that keeps dying in the middle
+# of the same step must not burn turns for ever, so the next cut stops the job and asks the owner.
+RESTART_RESUME_MAX = 2
+
+
+def restart_resume_on() -> bool:
+    """JAVIS_RESUME_AFTER_RESTART=0 gives the old behaviour back: work a restart cut short waits for the owner."""
+    return str(os.environ.get("JAVIS_RESUME_AFTER_RESTART", "1")).strip().lower() not in ("0", "false", "off", "no")
+
+
+def once_key(task_id: str, step: dict) -> str:
+    """Key of the once-only record of outside actions (once_ledger.py) for one job step AND every retry of it: a retry
+    is a new step with the same kind, member, brief and job revision (team_retry.chain_failures uses the same four).
+    So a step that runs again after a restart does not send, post or order what its first run already did, while
+    another step of the job that happens to make the same call is not held back."""
+    raw = "\x1f".join(str(x) for x in (step.get("kind") or "", step.get("agent_key") or "", step.get("brief") or "",
+                                        step.get("job_revision")))
+    return f"team:{task_id}:{hashlib.sha256(raw.encode('utf-8', 'replace')).hexdigest()[:16]}"
 # 0.449.0: the block the /skill command puts before the owner's words (dashboard/chat-slash.js buildSkillInvocation).
 SKILL_BLOCK_RE = re.compile(r"\[SKILL:\s*([A-Za-z0-9_-]+)")
 SKILLS_PER_TURN = 3
@@ -114,7 +134,10 @@ LEASE_RENEW_S = 30.0
 CLI_PROVIDERS = ("anthropic-cli", "openai-oauth", "grok-cli", "antigravity-cli")
 ENGINE_SLOTS_CLI = 3
 ENGINE_SLOTS_API = 6
-MAX_PARALLEL_TEAMS = 4
+# 17/11/2026 (owner: "anh không muốn giới hạn team làm việc luôn"): no cap on the teams at work nor on the jobs one team
+# runs at once. 0 means no cap; JAVIS_TEAM_PARALLEL / JAVIS_TEAM_JOBS still set one on a small machine. Model calls at
+# the same time stay bounded by the engine slots below, and tool turns by the slots of their working folder.
+MAX_PARALLEL_TEAMS = 0
 # 0.260.0: bước Làm/Hỗ trợ đang chờ của MỘT việc chạy cùng lúc theo đợt, tối đa JOB_PARALLEL bước (JAVIS_TEAM_JOB_PARALLEL;
 # 1 = lần lượt như trước). Lượt có công cụ giữ chỗ theo THƯ MỤC làm việc của nhóm (thư mục đã ghim, không có thì cả brain),
 # tối đa TOOL_SLOTS lượt mỗi thư mục (JAVIS_TEAM_TOOL_SLOTS; 1 = khoá chặt như 0.194.0).
@@ -169,9 +192,9 @@ FEEDBACK_NOTE = ("Emoji là cảm xúc của chủ nhóm, có thể về sự vi
 PEER_FEEDBACK_NOTE = ("Góp ý của đồng đội là tham khảo, không phải yêu cầu của chủ nhóm và không phải chấm điểm; chỉ điều "
                       "chỉnh khi lý do hợp lý.")
 # Toàn quyền (T3, spec 13, 15.2). Trần trưởng nhóm đổi được (trong trần trần của chủ) và lệnh quản trị.
-AUTH_CAPS = ("task_turns", "task_steps", "help_depth", "daily_turns", "judge_daily", "volunteer_k")
+AUTH_CAPS = ("task_turns", "task_steps", "help_depth", "judge_daily", "volunteer_k")
 # "Không giới hạn" của các trần lượt model này chỉ cho provider chủ tích (D6). Lô phán xử chạy model việc nền ("aux").
-MODEL_TURN_CAPS = ("task_turns", "daily_turns", "judge_daily")
+MODEL_TURN_CAPS = ("task_turns", "judge_daily")
 ADMIN_OPS_PER_TURN = 10   # trần lệnh quản trị mỗi lượt (review T3)
 ADMIN_OPS = ("open_job", "reprioritize", "add_member", "remove_member", "create_agent", "set_cap", "set_resonance",
              "edit_agent", "interrupt")
@@ -504,14 +527,15 @@ class TeamRunner:
         self._notify_fn = notify
         self.worker_id = worker_id
         if max_parallel_teams is None:
-            max_parallel_teams = env_int("JAVIS_TEAM_PARALLEL", MAX_PARALLEL_TEAMS)
-        self.max_parallel_teams = max(1, int(max_parallel_teams))
+            max_parallel_teams = env_int("JAVIS_TEAM_PARALLEL", MAX_PARALLEL_TEAMS, lo=0)
+        # None = no cap (owner, 17/11/2026), shown as "Không giới hạn" in the limits table.
+        self.max_parallel_teams = int(max_parallel_teams) if int(max_parallel_teams or 0) > 0 else None
         # 0.257.0: số lượt nhóm gọi model cùng lúc theo engine (xem CLI_PROVIDERS). Đặt lại được sau khi dựng (test).
         self.engine_slots_cli = env_int("JAVIS_TEAM_CLI_SLOTS", ENGINE_SLOTS_CLI)
         self.engine_slots_api = env_int("JAVIS_TEAM_API_SLOTS", ENGINE_SLOTS_API)
         self.job_parallel = env_int("JAVIS_TEAM_JOB_PARALLEL", JOB_PARALLEL)
-        # Jobs ONE team runs at once (2026-11-12, team_store.FIXED_CAPS): 1 = one after the other, as before.
-        self.team_jobs = max(1, env_int("JAVIS_TEAM_JOBS", FIXED_CAPS["running_jobs"]))
+        # Jobs ONE team runs at once: no cap by default (owner, 17/11/2026), JAVIS_TEAM_JOBS=1 = one after the other.
+        self.team_jobs = env_int("JAVIS_TEAM_JOBS", FIXED_CAPS["running_jobs"] or 0, lo=0) or None
         self.tool_slots = env_int("JAVIS_TEAM_TOOL_SLOTS", TOOL_SLOTS)
         self._slots: dict = {}
         self._slots_loop: Any = None
@@ -1091,7 +1115,7 @@ class TeamRunner:
             # Dòng "chưa có điều phối": thử lại là giao tin cho điều phối HIỆN TẠI (đúng một lượt), dòng chỗ trống khép lại.
             leader = team.get("leader_key")
             if not leader:
-                raise TeamError("nhóm chưa có người điều phối")
+                raise TeamError("nhóm chưa có phó nhóm")
             row = self.teams.retry_reply(team_id, int(message_id), LEADER_SLOT)
             if row is None:
                 return None
@@ -1704,7 +1728,7 @@ class TeamRunner:
         with self.accept_lock:
             row = self.teams.grant_authority(team_id, clean, by=by)
         team = self._team(team_id)
-        self._post(team, f"Chủ nhóm đã cho người điều phối {self._name(team, row['leader_key'])} tự quyết trong nhóm.",
+        self._post(team, f"Chủ nhóm đã cho phó nhóm {self._name(team, row['leader_key'])} tự quyết trong nhóm.",
                    author_kind="system", meta={"kind": "authority_granted"})
         self._state(team_id)
         return row
@@ -1801,7 +1825,7 @@ class TeamRunner:
             '{"op": "add_member", "slug": "<slug trợ lý có sẵn>"}',
             '{"op": "remove_member", "agent": "<thành viên>"}',
             '{"op": "create_agent", "name": "...", "role": "...", "prompt": "..."}',
-            '{"op": "set_cap", "cap": "<task_turns|task_steps|help_depth|daily_turns>", "value": 10}',
+            '{"op": "set_cap", "cap": "<task_turns|task_steps|help_depth>", "value": 10}',
             '{"op": "edit_agent", "agent": "<trợ lý do nhóm quản lý>", "prompt": "..."}',
             '{"op": "set_resonance", "agent": "<trợ lý do nhóm quản lý>", "on": true}',
         ]
@@ -1997,7 +2021,7 @@ class TeamRunner:
                 if not task or task.get("team_id") != team_id or task["status"] != "team_running":
                     raise TeamError("không có việc đang chạy này trong nhóm")
                 reason = str(op.get("reason") or "").strip()[:300] or "không nêu lý do"
-                self.cancel_job(task["id"], f"người điều phối ngắt: {reason}")
+                self.cancel_job(task["id"], f"phó nhóm ngắt: {reason}")
                 self.teams.log_event(team_id, "job_interrupted", by, None, {"task_id": task["id"], "reason": reason})
                 self._system(team, f"Trưởng nhóm {lead} đã ngắt việc \"{task['title']}\": {reason}.", "job_interrupted")
             else:
@@ -2450,10 +2474,12 @@ class TeamRunner:
                 await on_wait(holder or {})
             except Exception:  # noqa: BLE001 - trạng thái hiển thị không được làm hỏng lượt
                 pass
-        try:
-            await asyncio.wait_for(lock.acquire(), timeout=wait)
-        except (asyncio.TimeoutError, TimeoutError):
-            return False
+        # 17/11/2026: this lock is held only by another turn of the same member IN THIS TEAM (jobs now run side by side).
+        # The step waits for them, however long, instead of stopping the job after `busy_wait_s`: the member is busy
+        # with another job of the same team and comes to this one next, like a person working through their list. The
+        # turn holding it ends within its own time limit. `busy_wait_s` still bounds the wait below, for a hold on the
+        # whole member from outside the team (pulse, review, another team's proactive turn).
+        await lock.acquire()
         deadline = time.monotonic() + wait
         try:
             # Bị huỷ khi luồng phụ đang lấy dòng khoá: run_io chờ nó xong rồi nhả đúng dòng vừa lấy (undo).
@@ -2492,7 +2518,7 @@ class TeamRunner:
                 auth = self.teams.active_authority(team['team_id'])
                 grant = (auth or {}).get('grant') or {}
                 explicit_owner = self.teams.owner_caps_after(team['team_id'], policy.get('limit_migrated_event', 0))
-                for key in ('daily_turns', 'task_turns'):
+                for key in ('task_turns',):   # no daily reply cap since 17/11/2026 (team_store.FIXED_CAPS)
                     if key in explicit_owner:
                         continue
                     explicit = grant.get('caps', {}).get(key)
@@ -2614,7 +2640,10 @@ class TeamRunner:
                "step_id": step["step_id"] if step else None, "turn_id": turn_id,
                'job_revision': step['job_revision'] if step else task['team_rev'] if task else None,
                'attempt': (task or {}).get('attempts'),
-               "tools": None if tool_turn else [], "tool_turn": tool_turn, "work_mode": work_mode}
+               "tools": None if tool_turn else [], "tool_turn": tool_turn, "work_mode": work_mode,
+               # 16/11/2026: outside actions of a tool step are recorded once per step chain, so the step can run again
+               # after a restart without repeating them (the host puts this in the turn's `job`, see once_key).
+               "once_key": once_key(task["id"], step) if tool_turn and step else ""}
         return {"pre": "done", "engine": str(engine or ""), "model": str(model or ""), "fn": fn, "req": req,
                 "tool_key": self._work_key(team) if tool_turn else ""}
 
@@ -3160,7 +3189,7 @@ class TeamRunner:
             return None if self._add_steps(team, task, specs) else "team_blocked"
         team = self._team(team["team_id"])
         if not team["leader_key"]:
-            return self._block(task["id"], "no_leader", "Nhóm chưa có người điều phối")
+            return self._block(task["id"], "no_leader", "Nhóm chưa có phó nhóm")
         ok = self._add_steps(team, task, [{"kind": "plan", "agent": team["leader_key"],
                                            "brief": f"Lập lại kế hoạch ({reason}). {task['intent']}",
                                            "inputs": self._done_results(task) or self._source_id(task)}])
@@ -3848,9 +3877,9 @@ class TeamRunner:
             res = self._after_steps(team, task)
             return ("return", res) if res else ("continue",)
         if step["kind"] in ("plan", "synthesize") and step["agent_key"] != team["leader_key"]:
-            self.teams.set_step_status(step["step_id"], "cancelled", "người điều phối đã đổi")
+            self.teams.set_step_status(step["step_id"], "cancelled", "phó nhóm đã đổi")
             if not team["leader_key"]:
-                return ("return", self._block(task_id, "no_leader", "Nhóm chưa có người điều phối"))
+                return ("return", self._block(task_id, "no_leader", "Nhóm chưa có phó nhóm"))
             self._coordinator_changed(team, task, team["leader_key"])
             if not self._add_steps(team, task, [{"kind": step["kind"], "agent": team["leader_key"],
                                                  "brief": step["brief"], "inputs": step["input_refs"]}]):
@@ -3999,7 +4028,7 @@ class TeamRunner:
                                 int(results[0]["job_revision"]))
         if len(results) > 1:
             if not team["leader_key"]:
-                return self._block(task["id"], "no_leader", "Nhóm chưa có người điều phối để tổng hợp")
+                return self._block(task["id"], "no_leader", "Nhóm chưa có phó nhóm để tổng hợp")
             ok = self._add_steps(team, task, [{"kind": "synthesize", "agent": team["leader_key"], "brief": "",
                                                "inputs": [s["result_msg_id"] for s in results]}])
             return None if ok else "team_blocked"
@@ -4092,10 +4121,10 @@ class TeamRunner:
             self.teams.finish_step(sid, "cancelled", mid, False, "theo yêu cầu cũ")
             return self._recoordinate(team, task, step, "yêu cầu đã sửa")
         if st == "leader_changed":
-            self.teams.finish_step(sid, "cancelled", mid, False, "người điều phối đã đổi")
+            self.teams.finish_step(sid, "cancelled", mid, False, "phó nhóm đã đổi")
             team = self._team(team["team_id"])
             if not team["leader_key"]:
-                return self._block(task["id"], "no_leader", "Nhóm chưa có người điều phối")
+                return self._block(task["id"], "no_leader", "Nhóm chưa có phó nhóm")
             self._coordinator_changed(team, task, team["leader_key"])
             ok = self._add_steps(team, task, [{"kind": step["kind"], "agent": team["leader_key"],
                                                "brief": step["brief"], "inputs": step["input_refs"]}])
@@ -4546,36 +4575,26 @@ class TeamRunner:
             await self.wait_jobs()
         return [tid for tid, _ in claimed]
 
-    def _job_owners(self, team: dict, task: dict) -> set:
-        """Who a job belongs to: the assistants it was given to, else the one who coordinates it (the leader plans it)."""
-        owners = {str(a) for a in self._assignees(task) if a}
-        return owners or {str(task.get("coordinator_key") or team.get("leader_key") or "")}
-
     def _next_job(self, team: dict) -> Optional[str]:
-        """The waiting job of `team` that may start now, or None (2026-11-12).
+        """The waiting job of `team` that may start now, or None.
 
-        Nothing running: the head of the queue, as always. Something running: the first waiting job whose assistants
-        are all free of the running jobs, so two assistants with two different jobs work at the same time while two
-        jobs of the same assistant keep their order. A job worded as an order ("sau khi ... xong", "lần lượt", "only
-        after ...": `asks_sequential`, the rule parts of one job already follow) waits for everything before it, and
-        no later job starts ahead of it."""
+        17/11/2026 (owner: "anh muốn chạy song song và chỉ đợi nhau khi việc của người này cần đợi kết quả của người
+        kia ... giống như mỗi người đi làm việc của họ khi được giao"): every waiting job starts at once, in queue order.
+        Before, a job only started when none of its assistants was in a running job, and a job given to the whole team
+        counted as the deputy lead's, so two such jobs ran one after the other although their work went to different
+        members. Now each member works through their own steps in the order they were asked (one turn at a time per
+        member in a team, `_acquire`, first come first served), and waiting happens only where a result is needed:
+        - inside a job, the parts of a plan that need another part's result are held until it is done (STEP_HELD);
+        - a job worded as an order ("sau khi ... xong", "lần lượt", "only after ...": `asks_sequential`) waits for every
+          job before it, and no later job starts ahead of it."""
         q = self.tasks.team_queue(team["team_id"])
         waiting = list(q.get("waiting") or [])
         if not waiting:
             return None
-        running = list(q.get("running") or [])
-        if not running:
-            return str(waiting[0]["id"])
-        busy: set = set()
-        for t in running:
-            busy |= self._job_owners(team, t)
-        for t in waiting:
-            if asks_sequential(t.get("intent")):
-                return None
-            if self._job_owners(team, t) & busy:
-                continue
-            return str(t["id"])
-        return None
+        head = waiting[0]
+        if q.get("running") and asks_sequential(head.get("intent")):
+            return None
+        return str(head["id"])
 
     def _claim_batch(self) -> list:
         with self._pool_lock:
@@ -4585,18 +4604,19 @@ class TeamRunner:
             per_team: dict[str, int] = {}
             for team_of in self._pool.values():
                 per_team[team_of] = per_team.get(team_of, 0) + 1
-            team_slots = self.max_parallel_teams - len(per_team)
+            team_slots = None if self.max_parallel_teams is None else self.max_parallel_teams - len(per_team)
             out: list = []
             current: Optional[str] = None   # việc đã nhận nhưng chưa xong bước đầu (lỗi ở đây cũng phải trả về hàng)
             try:
                 for team_id in self.tasks.teams_with_waiting():
                     have = per_team.get(team_id, 0)
-                    if have >= self.team_jobs or (not have and team_slots <= 0):
+                    if (self.team_jobs is not None and have >= self.team_jobs) or (
+                            not have and team_slots is not None and team_slots <= 0):
                         continue
                     team = self.teams.get(team_id)
                     if not team or team["status"] != "active":
                         continue
-                    while have < self.team_jobs:
+                    while self.team_jobs is None or have < self.team_jobs:
                         pick = self._next_job(team)
                         if not pick:
                             break
@@ -4611,13 +4631,13 @@ class TeamRunner:
                         first = self.start_job_steps(task["id"])
                         current = None
                         if first == "no_leader":
-                            self._block(task["id"], "no_leader", "Nhóm chưa có người điều phối")
+                            self._block(task["id"], "no_leader", "Nhóm chưa có phó nhóm")
                             continue
                         if first == "assignee_removed":
                             self._block(task["id"], "assignee_removed", "Người được giao đã rời nhóm")
                             continue
                         self._pool[task["id"]] = team_id
-                        if not have:
+                        if not have and team_slots is not None:
                             team_slots -= 1
                         have += 1
                         per_team[team_id] = have
@@ -4772,22 +4792,73 @@ class TeamRunner:
             steps = self.teams.steps(task_id)
             last = next((s for s in reversed(steps) if s["status"] in ("failed", "interrupted")), None)
             if last:
-                new = self.teams.add_step(task_id, task["team_id"], last["kind"], last["agent_key"],
-                                          int(task["team_rev"]), last["brief"], last["input_refs"], last["parent_step"],
-                                          part=last.get("part") or "")
-                ap_id = ""
-                if self.approvals is not None:
-                    granted = self.approvals.approved_for_step(last["step_id"])
-                    ap_id = granted["approval_id"] if granted else ""
-                if ap_id:
-                    # 0.207.0: a step the owner approved was interrupted (restart, error). Its approval moves to the
-                    # retry; calls already used stay used, so nothing that already happened can happen twice.
-                    self.teams.set_step_status(new["step_id"], "queued", f"approval:{ap_id}")
-                    self.approvals.granted_step(ap_id, new["step_id"])
+                self._run_step_again(task, last)
         done = self.tasks.team_unblock(task_id) is not None
         if done:
             self._judge_job_changed(task_id, task["team_id"])
         return done
+
+    def _run_step_again(self, task: dict, last: dict) -> dict:
+        """A new step for the same member with the same brief, queued behind the failed or interrupted one."""
+        new = self.teams.add_step(task["id"], task["team_id"], last["kind"], last["agent_key"],
+                                  int(task["team_rev"]), last["brief"], last["input_refs"], last["parent_step"],
+                                  part=last.get("part") or "")
+        ap_id = ""
+        if self.approvals is not None:
+            granted = self.approvals.approved_for_step(last["step_id"])
+            ap_id = granted["approval_id"] if granted else ""
+        if ap_id:
+            # 0.207.0: a step the owner approved was interrupted (restart, error). Its approval moves to the
+            # retry; calls already used stay used, so nothing that already happened can happen twice.
+            self.teams.set_step_status(new["step_id"], "queued", f"approval:{ap_id}")
+            self.approvals.granted_step(ap_id, new["step_id"])
+        return new
+
+    def _restart_stop_reason(self, task: dict, cut: list) -> str:
+        """Why a job whose steps `cut` were interrupted by a restart must NOT continue by itself ("" = it may)."""
+        plain = localefmt.chu("Máy chủ khởi động lại giữa chừng nên bước đang làm bị dừng",
+                              "The server restarted in the middle of this step, so the step stopped")
+        if not restart_resume_on():
+            return plain
+        steps = self.teams.steps(task["id"])
+        for s in cut:
+            key = (s.get("kind"), s.get("agent_key"), s.get("brief") or "", s.get("job_revision"))
+            times = sum(1 for x in steps if x.get("status") == "interrupted"
+                        and (x.get("kind"), x.get("agent_key"), x.get("brief") or "", x.get("job_revision")) == key)
+            if times > RESTART_RESUME_MAX:
+                return localefmt.chu(
+                    f"Máy chủ đã khởi động lại {times} lần giữa cùng một bước, nên Javis không tự chạy lại nữa",
+                    f"The server restarted {times} times in the middle of the same step, so Javis stopped running it again")
+            if s.get("kind") not in TOOL_ROLES:
+                continue
+            try:
+                unsure = once_ledger.unknowns(once_key(task["id"], s))
+            except Exception:  # noqa: BLE001 - no ledger means nothing was recorded for this step
+                unsure = []
+            if unsure:
+                what = str(unsure[0].get("target") or unsure[0].get("tool") or "").strip()[:160]
+                return localefmt.chu(
+                    f"Máy chủ khởi động lại đúng lúc bước này đang làm một việc ra ngoài, chưa rõ đã xong chưa: {what}. "
+                    "Kiểm tra rồi bấm Làm tiếp",
+                    f"The server restarted while this step was doing something outside, and it is unclear whether it "
+                    f"went through: {what}. Check it, then press Continue")
+        return ""
+
+    def _continue_after_restart(self, task: dict, cut: list) -> None:
+        """The interrupted steps run again as new steps and the team chat says so in one line."""
+        for s in cut:
+            self._run_step_again(task, s)
+        self.teams.log_event(task["team_id"], "job_resumed_after_restart", "host", None,
+                             {"task_id": task["id"], "steps": [s["step_id"] for s in cut]})
+        team = self.teams.get(task["team_id"])
+        if team and team.get("status") != "archived":
+            try:
+                self._post(team, localefmt.chu(
+                    f"Máy chủ vừa khởi động lại. Việc \"{task['title']}\" tự làm tiếp bước đang dở.",
+                    f"The server just restarted. The job \"{task['title']}\" carries on with the step it was in."),
+                    author_kind="system", task_id=task["id"], meta={"kind": "job_resumed"})
+            except Exception:  # noqa: BLE001 - the note must not stop the job from carrying on
+                pass
 
     def _cap_record(self, task: dict) -> Optional[dict]:
         """Bản ghi `cap_blocked` mới nhất của việc (trần đã chạm, các bước bị từ chối). Mỗi lần chặn ghi bản ghi TRƯỚC khi
@@ -4905,10 +4976,18 @@ class TeamRunner:
 
     def recover(self) -> dict:
         """Sau restart (spec 8.6): lượt chưa tới mốc engine thì hoàn, bước về chờ, việc chạy tiếp; lượt đã qua mốc thì
-        `interrupted` (tính một lần), bước `interrupted`, việc chặn với nút "Chạy lại bước". Không tự chạy lại."""
+        `interrupted` (tính một lần), bước `interrupted`.
+
+        16/11/2026 (owner: "sau mỗi lần cập nhật thì các team tự khởi động lại để tiếp tục công việc"): the job then
+        carries on by itself with a new step for the same member, what the Continue button does. It still stops and
+        asks in two cases (`_restart_stop_reason`): an outside action of the step may already have gone out, or
+        restarts cut the same step RESTART_RESUME_MAX times already. Chat replies a restart cut short are handed back
+        in `replies` for the caller to run again (they are text only, nothing can happen twice)."""
         self._recover_acceptance_decisions()
         interrupted_tasks = set()
-        for r in self.teams.interrupt_open_replies(before=self.started_at):
+        cut_steps: dict = {}
+        cut_replies = self.teams.interrupt_open_replies(before=self.started_at)
+        for r in cut_replies:
             self._publish_replies(r["team_id"], r["message_id"])
         for t in self.teams.open_turns():
             self.teams.release_busy(t["agent_key"], t["turn_id"])
@@ -4921,20 +5000,50 @@ class TeamRunner:
                 self._settle_turn(t["turn_id"], "interrupted")
                 if t["step_id"]:
                     self.teams.set_step_status(t["step_id"], "interrupted", "server khởi động lại giữa lượt")
+                    if t["task_id"]:
+                        cut_steps.setdefault(t["task_id"], []).append(t["step_id"])
                 if t["task_id"]:
                     interrupted_tasks.add(t["task_id"])
         resumed, blocked = [], []
         for task in self.tasks.team_running_tasks():
             self._ensure_quality_contract(task['id'])
             self.tasks.team_take_over(task["id"], self.worker_id)
-            if task["id"] in interrupted_tasks:
-                self._block(task["id"], "interrupted", "Máy chủ khởi động lại giữa chừng nên bước đang làm bị dừng")
+            # A clean stop settles the turn itself (CancelledError in `_turn`) and leaves its step `running` with no
+            # open turn. Nothing runs in this new process yet, so such a step was cut short too.
+            for s in self.teams.steps(task["id"]):
+                if s["status"] == "running":
+                    self.teams.set_step_status(s["step_id"], "interrupted", "server khởi động lại giữa lượt")
+                    cut_steps.setdefault(task["id"], []).append(s["step_id"])
+                    interrupted_tasks.add(task["id"])
+            if task["id"] not in interrupted_tasks:
+                resumed.append(task["id"])
+                continue
+            ids = cut_steps.get(task["id"]) or []
+            cut = [s for s in self.teams.steps(task["id"]) if s["step_id"] in ids]
+            why = self._restart_stop_reason(task, cut)
+            if why or not cut:
+                self._block(task["id"], "interrupted", why or localefmt.chu(
+                    "Máy chủ khởi động lại giữa chừng nên bước đang làm bị dừng",
+                    "The server restarted in the middle of this step, so the step stopped"))
                 blocked.append(task["id"])
             else:
+                self._continue_after_restart(task, cut)
                 resumed.append(task["id"])
         # Sổ chung: lượt nhóm của tiến trình trước đã hoàn hay chốt ở trên; dòng sổ thiếu hay dư được đối soát (9.1).
         self.reconcile_ceiling(startup=True)
         # 0.209.0: a product check that was running when the server stopped runs again (the caller spawns `recheck`).
         rechecks = [t["id"] for t in self.tasks.team_tasks_by_status("team_blocked")
                     if t.get("block_kind") == "acceptance_checking"]
-        return {"resumed": resumed, "blocked": blocked, "rechecks": rechecks}
+        replies = [{"team_id": r["team_id"], "message_id": r["message_id"], "agent_key": r["agent_key"]}
+                   for r in cut_replies] if restart_resume_on() else []
+        return {"resumed": resumed, "blocked": blocked, "rechecks": rechecks, "replies": replies}
+
+    async def retry_cut_replies(self, rows: list) -> None:
+        """Chat replies a restart cut short run again, as if the owner pressed Retry on each line."""
+        for row in rows or []:
+            try:
+                sub = await self._io(self.retry_reply, row["team_id"], int(row["message_id"]), row["agent_key"])
+            except Exception:  # noqa: BLE001 - a team archived or a message gone meanwhile: nothing to retry
+                continue
+            if sub is not None:
+                await self.run_replies(sub)

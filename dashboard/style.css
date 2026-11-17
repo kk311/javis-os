@@ -2488,6 +2488,8 @@ textarea.sug-ghosted::placeholder { color: transparent; }
 .cs-proj-cur:hover { border-color: var(--info-line); color: var(--text); }
 .cs-proj-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cs-proj-caret { flex: none; opacity: .6; display: inline-flex; }
+.cs-proj-unread { display: inline-block; flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--red); }
+.cs-proj-unread[hidden] { display: none; }
 .cs-proj-x, .cs-proj-add { flex: none; width: 30px; height: 30px; border-radius: 8px;
   display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
   border: 1px solid var(--border); background: transparent; color: var(--text3); }
@@ -5072,6 +5074,9 @@ select option, select optgroup { background-color: var(--bg2); color: var(--text
 .gh-tick { flex: none; display: inline-flex; color: var(--accent, #3b82f6); }
 .gh-tick svg { width: 18px; height: 18px; }
 .gh-results { display: flex; flex-direction: column; gap: 2px; }
+/* Where the list has a max-height (project drawer, create-team box, team chat pop-up) it must scroll. A group clips its
+   own overflow, so without this the browser shrinks the groups instead and "Selected" is cut to a sliver (2026-11-16). */
+.gh-results > * { flex: none; }
 /* "Add repos on GitHub" is a link styled as a menu row, and the same link inline in the empty list (0.438.1). */
 a.cp-mi.gh-more-conn { text-decoration: none; color: inherit; }
 .gh-results .cp-empty a[data-gh-add] { color: var(--accent, #3b82f6); text-decoration: underline; }

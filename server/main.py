@@ -168,6 +168,7 @@ import resonance_api           # Javis Resonance MVP: API thẻ mục tiêu và 
 import agent_presence          # Auto registry in step with the assistant files (pack reinstall, 2026-11-11)
 import limit_learner          # học hạn mức từ chính lỗi nhà cung cấp trả về
 import limit_resume           # tự chạy lại lượt chat khi gói thuê bao mở lại hạn mức
+import turn_ledger            # chat turns in flight, on disk: a restart cuts them, the next process runs them again
 import quota_scheduler        # sổ cái TPM dùng chung (Việc 6)
 import model_limits           # hạn mức GỢI Ý theo provider, để khai quota profile cho canary
 import model_router           # Phase 12: chọn model theo từng bước, lọc năng lực trước
@@ -202,6 +203,7 @@ import javis_core        # Javis Core (0.185.0): system assistant pinned in ever
 import main_prompt_rendering  # pure shared prompt blocks; no live reads
 import main_attachment_rendering  # pure shared attachment templates; no live reads
 import memory_control    # 0.188.0: list/edit/forget memories, learning switch, person profile
+import agent_learned     # 2026-11-16: the Learned tab of an assistant (Cộng sự page)
 import memory_chat       # 0.190.0: the same, plus agent lessons, from chat (tool javis_memory)
 import project_context   # 2026-11-13: what Javis learnt about a project, and tool javis_project
 import memory_receipt    # 0.190.0: the "Đã nhớ · Hoàn tác" line under an answer, and no empty "đã quên"
@@ -249,6 +251,10 @@ import voice_call     # nút mic là gọi Javis: tự chọn ChatGPT Live / Liv
 
 app = FastAPI(title="Javis OS")
 _CHAT_RUNTIME = ChatRuntime()
+# 16/11/2026: a chat job that is over closes its row in the ledger of turns in flight (kept during shutdown).
+_CHAT_RUNTIME.on_finish = turn_ledger.end
+_CHAT_RUNTIME.on_start = lambda sid, turn: turn_ledger.begin(
+    sid, turn.get("user_mid") or 0, turn.get("user_message") or "", turn.get("user_text"), turn.get("brain") or "")
 
 
 def _steer_read(sid, ids):
@@ -7257,6 +7263,13 @@ async def connect_substack_resolve_uid(q: str = Query("")):
 @app.post("/connect/update")
 async def connect_update(request: Request):
     data = await request.json()
+    # "Change key" form of a Google connection: borrow the key of another connection of the same family, copied
+    # here on the server (reuse_client_fields checks the family). The browser only names the donor.
+    reuse_from = (data.get("reuse_from") or "").strip()
+    if reuse_from and data.get("id"):
+        own = mcp_store.get_connection(data.get("id")) or {}
+        data = dict(data, fields=mcp_store.reuse_client_fields(
+            mcp_catalog.get(own.get("connector_id")), data.get("fields") or {}, reuse_from))
     ok = mcp_store.update_connection(data.get("id"), data)
     mcp_hub.invalidate_cache()
     return {"ok": ok}
@@ -14526,6 +14539,44 @@ async def _ghi_lich_su(gen, *, brain, slug, name, input, source, session_id, run
                 st.ket_thuc(rid, "error", error="dừng giữa chừng")
             except Exception:
                 pass
+
+
+def close_cut_workflow_runs() -> list:
+    """Workflow runs the last restart cut short (owner, 16/11/2026: work in flight must not be lost by an update).
+
+    A run that was `running` when the process died used to say "running" for ever. It is closed with the reason. What
+    happens next depends on who started it:
+    - Kanban, a reminder, a loop or a webhook: that scheduler runs its job again by itself (the Kanban job goes back
+      to the queue, the reminder is still due, the loop is still overdue), which starts a new run.
+    - The owner, in the workflow's chat (source "web"): it is NOT run again from the start, because the steps that had
+      finished may have sent or posted something and a workflow run has no once-only record of its own. The chat gets
+      one stored line saying where the run stopped, and Run starts it again."""
+    import workflow_runs
+    rows = workflow_runs.get_store().close_cut(_PROCESS_STARTED, localefmt.chu(
+        "Máy chủ khởi động lại giữa chừng", "The server restarted in the middle of this run"))
+    for r in rows:
+        if r.get("source") != "web" or not r.get("session_id"):
+            continue
+        done = sum(1 for b in (r.get("steps") or []) if b.get("output"))
+        name = str(r.get("name") or r.get("slug") or "")
+        try:
+            get_store().append_message(str(r["session_id"]), "assistant", localefmt.chu(
+                f"Máy chủ khởi động lại khi quy trình \"{name}\" đang chạy (đã xong {done} bước). Javis không tự chạy "
+                "lại từ đầu, vì các bước đã xong có thể đã gửi hoặc đăng gì đó. Bấm Chạy để chạy lại.",
+                f"The server restarted while the workflow \"{name}\" was running ({done} steps done). Javis did not "
+                "run it again from the start, because the finished steps may have sent or posted something. "
+                "Press Run to run it again."))
+        except Exception as ex:  # noqa: BLE001 - the chat of the run is gone: the history row still tells it
+            print(f"[workflow cut note] {type(ex).__name__}: {ex}", file=sys.stderr)
+    return rows
+
+
+@app.on_event("startup")
+async def _close_cut_workflow_runs():
+    try:
+        await asyncio.to_thread(close_cut_workflow_runs)
+    except Exception as ex:  # noqa: BLE001 - never keep the server from starting
+        print(f"[workflow cut runs] {type(ex).__name__}: {ex}", file=sys.stderr)
 
 
 # Sources that run a workflow with nobody pressing a button. A workflow switched off is not run
@@ -22670,6 +22721,59 @@ async def _chat_socket(ws):
                 runtime_step_id=runtime_trace.step_id if runtime_trace else "",
             )
 
+        async def _resume_cut_turns():
+            """Chat turns the last restart cut short answer again (owner, 16/11/2026: "việc nào đang dang dở kể cả ở
+            cộng sự, ở chat ... khởi động lại server sau khi update cũng phải khởi động lại").
+
+            Runs when a page connects, because a chat turn is built from this handler's closures: the first page back
+            after the restart (the dashboard reloads by itself after an update) takes every cut turn, once. A turn is
+            run again only while its question is still the last message of the chat. It is NOT run again when it had
+            already done something outside (send, post, order), or when restarts cut it turn_ledger.MAX_RESUMES times;
+            the chat then gets one stored line saying why."""
+            for row in turn_ledger.take_cut():
+                sid = row["session_id"]
+                try:
+                    msgs = await asyncio.to_thread(store.get_messages, sid) or []
+                except Exception:  # noqa: BLE001 - the session is gone
+                    msgs = []
+                last = msgs[-1] if msgs else {}
+                if (not turn_ledger.resume_on() or not row["user_mid"] or last.get("role") != "user"
+                        or int(last.get("id") or 0) != int(row["user_mid"]) or _CHAT_RUNTIME.get_job(sid)):
+                    turn_ledger.drop(sid)
+                    continue
+                why = ""
+                if row["acted"]:
+                    why = localefmt.chu(
+                        "Máy chủ khởi động lại khi Javis đang làm dở câu này, và lượt đó đã làm một việc ra ngoài "
+                        "(gửi, đăng, tạo...). Javis không tự chạy lại để tránh làm trùng. Nhắn \"làm tiếp\" nếu "
+                        "bạn muốn Javis làm nốt.",
+                        "The server restarted while Javis was in the middle of this, and that turn had already done "
+                        "something outside (sent, posted, created...). Javis did not run it again so nothing "
+                        "happens twice. Say \"continue\" if you want Javis to finish.")
+                elif int(row["resumes"] or 0) >= turn_ledger.MAX_RESUMES:
+                    why = localefmt.chu(
+                        "Máy chủ đã khởi động lại nhiều lần khi đang trả lời câu này nên Javis dừng tự chạy lại. "
+                        "Gửi lại câu hỏi khi máy chủ đã ổn.",
+                        "The server restarted several times while answering this, so Javis stopped running it again. "
+                        "Send the question again once the server is steady.")
+                if why:
+                    turn_ledger.drop(sid)
+                    _persist_limit_notice(store, sid, row["user_message"], why)
+                    await send_raw({"type": "system", "session_id": sid, "content": why})
+                    continue
+                await send_raw({"type": "system", "session_id": sid, "content": localefmt.chu(
+                    "Máy chủ vừa khởi động lại. Javis trả lời lại câu đang dở.",
+                    "The server just restarted. Javis is answering the question it was on again.")})
+                # On disk again until this run is over; the same question keeps its count of restarts.
+                turn_ledger.begin(sid, int(row["user_mid"]), row["user_message"], row["user_text"], row["brain"])
+                await _start_resumed_turn(sid, row["user_message"], row["brain"], 0, None,
+                                          user_mid=int(row["user_mid"]), user_text=row["user_text"])
+
+        try:
+            await _resume_cut_turns()
+        except Exception as _e:  # noqa: BLE001 - a broken resume must never keep a page from connecting
+            print(f"[turn resume] {type(_e).__name__}: {_e}", file=sys.stderr)
+
         while True:
             raw = await _real_ws.receive_text()
             try:
@@ -22715,13 +22819,18 @@ async def _chat_socket(ws):
                     _sid = str(payload.get("session_id") or "").strip()
                     _txt = str(payload.get("message") or "").strip()[:steer_inbox.MAX_CHARS]
                     _cid = str(payload.get("client_id") or "")[:40]
+                    # 2026-11-16: typed while a /goal runs. The goal goes on: the round reads it, or the dashboard folds
+                    # it into the next round. Never a turn of its own ("goal" mode): that would race the next round.
+                    _goal = bool(payload.get("goal"))
                     _row = store.get_session(_sid) if _sid else None
                     if not _row or not _txt:
                         continue
                     store.append_message(_sid, "user", _txt)
-                    _it = steer_inbox.INBOX.put(_sid, _txt)
+                    _it = steer_inbox.INBOX.put(_sid, _txt, goal=_goal)
                     if _it:
-                        _mode, _id = ("live" if steer_inbox.INBOX.live(_sid) else "after"), _it["id"]
+                        _mode, _id = ("live" if steer_inbox.INBOX.live(_sid) else ("goal" if _goal else "after")), _it["id"]
+                    elif _goal:
+                        _mode, _id = "goal", 0
                     else:
                         # The turn just ended (or too many are waiting): this message is its own next turn.
                         _mode, _id = "after", 0
@@ -23007,6 +23116,7 @@ async def _chat_socket(ws):
                     except Exception:
                         _vconf = None
                     _bao_lan_nhanh_bo_qua(_vconf)
+                _turn_row = None
                 if _vconf and _vconf.get("mode") == "fast" and _vconf.get("provider"):
                     _voice_coro = run_voice_turn(
                         conv_sid, user_message, brain, turn_tag, runtime_trace, _vconf,
@@ -23020,10 +23130,15 @@ async def _chat_socket(ws):
                         conv_sid, user_message, brain, turn_tag, runtime_trace, has_attachments,
                         goc_chat=_goc, user_mid=_user_mid, effort=str(payload.get("effort") or ""))
                     task = asyncio.create_task(voice_turn_protocol.run(_voice_coro, store, conv_sid, _voice_uid) if _voice_uid else _voice_coro)
+                    # 16/11/2026: the owner's question goes on disk with its job (`turn=`), so a restart in the middle
+                    # answers it again (the ledger of turns in flight, `_resume_cut_turns`). Passed through the
+                    # runtime, not written here, because tests run this block and `run_turn` on their own with stubs.
+                    _turn_row = {"user_mid": _user_mid, "user_message": user_message, "user_text": None, "brain": brain}
                 _CHAT_RUNTIME.register_job(
                     conv_sid, task, turn_tag,
                     runtime_task_id=runtime_trace.task_id if runtime_trace else "",
                     runtime_step_id=runtime_trace.step_id if runtime_trace else "",
+                    turn=_turn_row,
                 )
                 if _pending_voice_receipt:
                     await send_client(_pending_voice_receipt)
@@ -31037,7 +31152,8 @@ async def slash_memory(brain: str = Query("brain")):
 
 @app.post("/slash/block")
 async def slash_block(kind: str = Form(...), dk: str = Form(""), vong: int = Form(1),
-                      toi_da: int = Form(lenh_he_thong.GOAL_MAX_ROUNDS), left: str = Form("")):
+                      toi_da: int = Form(lenh_he_thong.GOAL_MAX_ROUNDS), left: str = Form(""),
+                      them: str = Form("")):
     """Khối chỉ dẫn của `/plan` và `/goal` cho khung chat web.
 
     Máy chủ là nguồn DUY NHẤT của chữ trong khối (Telegram dùng chung `lenh_he_thong`): trình
@@ -31051,7 +31167,13 @@ async def slash_block(kind: str = Form(...), dk: str = Form(""), vong: int = For
                                 status_code=400)
         toi_da = max(1, min(int(toi_da), 20))
         vong = max(1, min(int(vong), toi_da))
-        return {"block": lenh_he_thong.khoi_muc_tieu(dk, vong, toi_da, left)}
+        # 2026-11-16: `them` = JSON list of what the owner typed while the goal ran (folded into the goal).
+        try:
+            _them = json.loads(them) if (them or "").strip() else []
+        except ValueError:
+            _them = []
+        _them = [str(x) for x in _them] if isinstance(_them, list) else []
+        return {"block": lenh_he_thong.khoi_muc_tieu(dk, vong, toi_da, left, _them)}
     return JSONResponse({"error": localefmt.chu("kind phải là plan hoặc goal", "kind must be plan or goal")},
                         status_code=400)
 
@@ -31325,6 +31447,9 @@ async def _warm_mcp_hub():
 @app.on_event("shutdown")
 async def _shutdown_mcp_pool():
     """Đóng các session MCP sống lâu (stdio subprocess, httpx client) khi server tắt."""
+    # 16/11/2026: from here on a chat turn that gets cancelled is a turn this stop cut short, not one that ended:
+    # its row stays in the ledger so the next process answers it again (turn_ledger.py).
+    turn_ledger.closing = True
     try:
         await _shutdown_improvement_candidates()
     except Exception:
@@ -31956,6 +32081,10 @@ def _team_engine_for(team, agent_key, role):
         # Bind before asyncio.to_thread: constructors and CLI correlation inherit the host execution.
         import uuid
         ambient = turn_context.current() or turn_context.make("team", chat_id=req.get("team_id"))
+        # 16/11/2026: a tool step of a team job records its outside actions once per step chain (once_ledger.py, keyed
+        # on the turn's `job`), so the step can run again after a restart without sending or posting twice.
+        if req.get("once_key"):
+            ambient["job"] = str(req["once_key"])
         ambient["execution"] = turn_context.execution_metadata({
             "team_id": req.get("team_id"), "task_id": req.get("task_id"), "step_id": req.get("step_id"),
             "turn_id": req.get("turn_id"), "attempt": req.get("attempt"), "job_revision": req.get("job_revision"),
@@ -34089,6 +34218,13 @@ async def _learn_tick():
 agent_review.register_routes(app, agent_review.LearnRouteDeps(
     brain_key=lambda b: _brain_key(b), agent_exists=lambda root, slug: _agent_md_path(root, slug) is not None,
     agent_key=lambda root, slug: _agent_jobs_key(root, slug), store=_pulse_store))
+# 2026-11-16: the Learned tab of an assistant (Cộng sự page): what it learnt, from the same store the prompt reads.
+agent_learned.register_routes(app, agent_learned.Deps(
+    brain_key=lambda b: _brain_key(b), agent_exists=lambda root, slug: _agent_md_path(root, slug) is not None,
+    agent_key=lambda root, slug, reg: _agent_jobs_key(root, slug, register=reg),
+    store=lambda create: _pulse_store() or (_resonance_store() if create else None),
+    legacy_file=lambda root, slug: _brain_memory_dir(root) / "agents" / slug / "MEMORY.md",
+    refuse=lambda text: project_context.blocked_reason(text)))
 
 @app.get("/model/fast-state")
 async def model_fast_state():

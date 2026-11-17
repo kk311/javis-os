@@ -612,6 +612,51 @@ class TaskStore:
             ).fetchall()
         return [{"id": str(r["id"]), "title": str(r["title"])} for r in rows]
 
+    # A job that keeps being running when the server dies gets its attempt back this many times; after that a cut
+    # costs an attempt like any failure, so a job that brings the server down cannot run for ever.
+    BOOT_REFUNDS = 2
+
+    def reclaim_boot(self, brain_root: str) -> int:
+        """At process start no worker is alive, so every `running` job of this brain was cut by the restart (owner,
+        16/11/2026: work in flight carries on by itself after an update). It goes back to `ready` at once instead of
+        waiting out its lease (`reclaim_stale`, up to 90 s), and the attempt the dead run had taken is given back:
+        a restart is not the job's failure, and on Windows every update is a hard kill, so three updates in the
+        middle of a long job used to fail it. Outside actions of the dead run stay protected by once_ledger.py.
+        Team jobs (`team_running`) are not touched: the team runner recovers those."""
+        ts = now()
+        with self._lock:
+            self._tx()
+            try:
+                rows = self._db.execute(
+                    "SELECT id, attempts, current_run_id FROM tasks WHERE brain_root=? AND status='running'",
+                    (brain_root,),
+                ).fetchall()
+                for row in rows:
+                    tid = str(row["id"])
+                    run_id = str(row["current_run_id"] or "")
+                    before = self._db.execute(
+                        "SELECT COUNT(*) AS n FROM task_runs WHERE task_id=? AND status='stale' AND error='server restarted'",
+                        (tid,),
+                    ).fetchone()["n"]
+                    back = 1 if int(before) < self.BOOT_REFUNDS else 0
+                    self._db.execute(
+                        """UPDATE tasks SET status='ready', claimed_by='', claim_expires_at=0, current_run_id='',
+                           attempts=MAX(attempts-?, 0), updated_at=? WHERE id=? AND status='running'""",
+                        (back, ts, tid),
+                    )
+                    if run_id:
+                        self._db.execute(
+                            """UPDATE task_runs SET status='stale', finished_at=?, error='server restarted'
+                               WHERE id=? AND status='running'""",
+                            (ts, run_id),
+                        )
+                    self._event(tid, "reclaimed", "server restarted", run_id)
+                self._db.commit()
+                return len(rows)
+            except Exception:
+                self._db.rollback()
+                raise
+
     def reclaim_stale(self, brain_root: str, active_worker_ids: set[str]) -> int:
         ts = now()
         with self._lock:
@@ -1788,7 +1833,7 @@ class TaskStore:
             self._db.commit()
 
     def claim_team_next(
-        self, team_id: str, worker_id: str, lease_s: int = 90, max_running: int = 1, task_id: Optional[str] = None,
+        self, team_id: str, worker_id: str, lease_s: int = 90, max_running: Optional[int] = 1, task_id: Optional[str] = None,
     ) -> Optional[dict]:
         """Nhận việc đầu hàng của nhóm nếu nhóm còn chỗ chạy (mặc định một việc mỗi nhóm).
 
@@ -1811,7 +1856,8 @@ class TaskStore:
                     "SELECT COUNT(*) AS n FROM tasks WHERE lane='team' AND team_id=? AND status='team_running'",
                     (team_id,),
                 ).fetchone()["n"]
-                if int(running) >= max(1, int(max_running)):
+                # `max_running=None`: no cap on the jobs a team runs at once (team_runner, 17/11/2026).
+                if max_running is not None and int(running) >= max(1, int(max_running)):
                     self._db.rollback()
                     return None
                 if task_id:

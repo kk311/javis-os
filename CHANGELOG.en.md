@@ -8,6 +8,114 @@ English entries start at 0.66.0. Every earlier release is described in the Vietn
 
 Format: each release is a `## [x.y.z] - date` block, with changes grouped under `### Added / Fixed / Improved / Security`.
 
+## [0.582.0] - 2026-11-17
+### Added
+- **Answer an approval card in the team chat.** The card has two big buttons with icons: Approve and Reply. Reply opens
+### Improved
+- **A tidier approval card.** The deadline reads "5 h left" at the top next to "Waiting for you"; evidence and calls fold
+
+## [0.581.1] - 2026-11-17
+### Improved
+- **The "Add Javis to your Home Screen" prompt no longer pops up right after you sign in.** It used to show 12 seconds
+
+## [0.581.0] - 2026-11-17
+### Improved
+- **The team's settings tab is much shorter and saves itself.** Advanced is gone (acceptance, usage, limit numbers, the
+- **A reply stopped by a limit no longer offers "Open the team limits"**, since there are no numbers to open; Try again
+
+## [0.580.0] - 2026-11-17
+### Improved
+- **A team no longer has a daily reply cap.** A team that used its 100 replies of the day used to stop every member
+
+## [0.579.0] - 2026-11-17
+### Improved
+- **Team jobs run side by side.** Every job given to a team starts at once, jobs given to the whole team too (they used to wait for each other because they all counted as the deputy lead's).
+- **Waiting only where a result is needed:** parts of one job that come one after another still wait for each other, and a job you word as "after … is done" or "one by one" still waits for the jobs before it. Each assistant works through the parts given to them, in the order given.
+- **No cap on jobs per team (was 3) nor on teams at work (was 4).** A step waiting for an assistant busy with another job of the same team now waits its turn instead of stopping as "busy too long".
+
+## [0.578.1] - 2026-11-17
+### Fixed
+- **The "Showing one job's messages" bar is one line** on a phone: the job's name, an icon for its acceptance and usage, an X to see every message again. It used to take three lines and push the chat down.
+- **Pressing a job's title or "Open the Jobs tab" in the job pill's details now opens it;** the details used to just close.
+- **A job you already answered no longer comes back on the pill** while you look at another job's messages. A job with no message yet says so in the chat.
+
+## [0.578.0] - 2026-11-17
+### Improved
+- **Team jobs fold into one pill right above the composer,** like background work in the main chat. Press it for the details: why a job stopped, the button that resolves it, who is working.
+- **A job waiting for you leaves the pill once you have written in the chat after it stopped.** It stays in the Jobs tab until it is resolved.
+- **Team roles renamed:** you, who made the team, are the Team lead; the assistant who leads the team is the Deputy lead (was "Coordinator"). Role badges stay on one line, and the role of each step ("Planning", "Working") is a small tag.
+- **The Jobs tab comes first in the side panel** (Jobs, Info, Team). A team with jobs opens on Jobs, a team without any opens on Info.
+### Fixed
+- **The reply suggestion no longer lands on top of the "is typing" line** when that line shows up above the input, on the Teams page and in the main chat.
+
+## [0.577.0] - 2026-11-17
+### Improved
+- **After an update, work in flight carries on by itself.** A team job cut in the middle continues with the step it was on, and a team reply that was being written is written again; no more pressing "Continue" or "Retry".
+- **A chat answer cut short is answered again** when the page comes back after the server restarts, in the main chat and in chats with an assistant.
+- **Background jobs go back to the queue at once** instead of waiting 90 seconds, and the cut no longer counts as a failed attempt.
+- **Nothing outside happens twice.** A step that had already sent a message, posted or created an order before the server stopped makes Javis stop and tell you instead of doing it again. A workflow run cut short no longer says "running" for ever.
+
+## [0.576.0] - 2026-11-16
+### Improved
+- **The team Jobs tab now follows the Tasks page.** Each job is a card, and right under it you see what every member is doing: done, working or waiting its turn, with what they were asked to do. Jobs waiting for you come first.
+- **Icons replace text buttons.** Edit, acceptance, cancel, priority and move to Archive are icons; one text button is left, on a job that waits for you. The Info, Jobs and Team tabs have icons, and Jobs shows how many jobs are open.
+- **Press a finished job to read a summary:** when it ended, the result, who did what. Finished jobs and the Archive are paged, five jobs a page.
+- **The Archive is no longer cut at 30 jobs** and gets a search box once it is longer than one page. "Delete all" stands apart at the end.
+
+## [0.575.2] - 2026-11-16
+### Fixed
+- **Playwright no longer says "browser not installed" right after Javis downloaded one.** Javis now hands Playwright the exact browser file it downloaded, so the two can run on different versions. A browser you chose yourself is left alone.
+
+## [0.575.1] - 2026-11-16
+### Fixed
+- **Playwright screenshots show right in the chat.** When Javis took a screenshot of a page with Playwright, the image reached the model as a long string of characters and nothing appeared in the chat. The image is now saved in the brain under `attachments/tool-images/` and Javis embeds it in its reply so you can preview it. Images returned by other tools (charts, designs) are handled the same way.
+
+## [0.575.0] - 2026-11-16
+### Improved
+- The project selector and project list show a red dot when another project has unread replies. The selected project uses its chat dots without a duplicate folder alert.
+- Opening a project keeps chats unread until they are opened. Badges update for new replies and reads in another tab.
+
+## [0.574.0] - 2026-11-16
+### Improved
+- **Typing while a goal runs no longer pauses it.** Your message is added to the goal: the running round reads it at its next step and every later round carries it, so you can adjust or widen the goal while Javis works. Each such message gives one more round (10 at most). If a round reports the goal met before it read your message, Javis runs one more round for it. The Stop button still pauses the goal as before.
+
+## [0.573.0] - 2026-11-16
+### Improved
+- **Reuse a Google key for every Google service.** The "Reuse this key" row now sits at the top of the form, shows on Google Ads, Analytics, Merchant Center and Search Console too, and borrows a key (service accounts included) saved for any other Google service. Google shows a client secret only once, when it is made, so the key kept in Javis is often the only copy left.
+- **Change a key right on the connection.** "Reconnect (sign in / change key)" on Gmail, Calendar, Analytics, Ads and the rest now opens a change-key form: pick a key saved for another service, or paste a new one, then sign in again.
+- **A warning before a key is lost.** Deleting the last connection that holds a Google key says so in the confirmation, with how to keep it.
+### Added
+- The Google Tag Manager pack in Javis Store signs in to Google right in the dashboard, like Analytics and Ads.
+
+## [0.572.0] - 2026-11-16
+### Added
+- **The Partners page has a Learned tab for each assistant.** The top bar button now reads "Documents & Learned". The new tab lists what the assistant worked out while working, exactly the lessons it uses, with where each applies (private chat, a team, everywhere). Edit, delete or add a lesson right there, like a project's Learned tab.
+- A lesson you add is used everywhere. A lesson you edit becomes yours and is never dropped when the list is full. Delete one and the assistant stops using it and does not learn those exact words again.
+### Improved
+- In the documents drawer of the Partners page the tabs sit above the "Of the assistant / Only this chat" switch, since that switch only belongs to the Documents tab.
+
+## [0.571.1] - 2026-11-16
+### Fixed
+- **An assistant's Jobs tab records each run it started on its own.** The Auto block could say "Worked on its own 1 times today" while the Jobs tab stayed empty, because the tab only read goals, team jobs, chat jobs and workflow runs. Each look around or self-review is now a card under the Auto source, with what it ended in: the work it did, a message to you, a job it proposed, or nothing that needed doing. Today's number and the cards always agree because both read the same ledger.
+
+## [0.571.0] - 2026-11-16
+### Added
+- **Javis Store has an All tab.** It comes first, puts every assistant, skill, workflow, tool and connector in one grid, and the Store opens on it. Its search box covers the whole Store, and each card says which kind it is.
+- **A search that finds nothing in one tab offers to search All.** The button shows how many items match in the other tabs and keeps the words you typed.
+
+## [0.570.1] - 2026-11-16
+### Fixed
+- **The repository picker in a project and a team is no longer cut off.** The "Selected" section used to show as a thin strip, and the list under it could not scroll to the last repositories. Every row now shows in full and the list scrolls, in the documents of a project or an assistant, the create-team box and the team chat.
+
+## [0.570.0] - 2026-11-16
+### Fixed
+- **A Store pack can be installed in several brains.** A pack installed in one brain used to show "Installed" in another brain with only Turn off and Uninstall, so its assistants and skills could never reach that brain. The card now offers "Install in this brain". Updating the pack brings every brain that has it to the new version, keeping what you edited. Uninstalling removes it from every brain, and the confirmation names each one.
+
+## [0.569.1] - 2026-11-16
+### Fixed
+- **Text Javis writes before and after each tool call no longer runs together** (as in "needs a sign-in.Done with item 3"). Each new stretch starts on a new line, on Claude Code, Codex, Grok Build and Antigravity.
+- **The notes Javis writes while it works follow your language too**, instead of drifting into English halfway through code or logs.
+
 ## [0.569.0] - 2026-11-16
 ### Added
 - **Webhooks can be edited after they are made.** The Configuration part of each webhook has an Edit button: change its name, its workflow or written job, the note and the permission level right in that window. The link and its key stay the same, so whatever sends events there needs no change.
