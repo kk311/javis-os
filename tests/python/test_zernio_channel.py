@@ -473,6 +473,119 @@ class ZernioTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("processing", current)
         self.assertEqual(conversations.che_do("zernio", "acc_a", "same-conversation"), "ai")
 
+    async def image_handoff(self):
+        await self.receive(self.image_event())
+        self.clock += 5
+        await self.flush()
+        self.assertEqual(conversations.che_do("zernio", "acc_a", "same-conversation"), "human")
+
+    def mode_now(self):
+        return conversations.che_do("zernio", "acc_a", "same-conversation")
+
+    async def test_staff_reply_resumes_ai_after_auto_handoff(self):
+        self.use_real_modes()
+        await self.image_handoff()
+        staff_at = self.clock
+        self.assertEqual((await self.receive(self.sent_event()))[1]["status"], "staff_message")
+        await self.flush_outgoing()
+        self.assertEqual(self.mode_now(), "ai")
+        self.assertNotIn("auto_handoff", self.delivery_state())
+        self.assertNotIn("resume_ai_pending", self.delivery_state())
+        self.clock = staff_at + 60
+        await self.receive(self.event("e2", "m2"))
+        self.clock += 5
+        await self.flush()
+        self.bot.answer_fn.assert_not_awaited()
+        self.clock = staff_at + z.STAFF_PAUSE_SECONDS + 1
+        await self.flush()
+        self.bot.answer_fn.assert_awaited_once()
+        self.bot.send_delivery.assert_awaited_once()
+
+    async def test_second_staff_reply_restarts_pause(self):
+        self.use_real_modes()
+        await self.image_handoff()
+        first = self.clock
+        await self.receive(self.sent_event())
+        await self.flush_outgoing()
+        self.clock = first + 200
+        await self.receive(self.sent_event("s2", "out2", text="second staff answer " + self._testMethodName))
+        await self.flush_outgoing()
+        self.clock = first + 250
+        await self.receive(self.event("e2", "m2"))
+        self.clock = first + z.STAFF_PAUSE_SECONDS + 1
+        await self.flush()
+        self.bot.answer_fn.assert_not_awaited()
+        self.clock = first + 200 + z.STAFF_PAUSE_SECONDS + 1
+        await self.flush()
+        self.bot.answer_fn.assert_awaited_once()
+
+    async def test_manual_takeover_not_resumed_by_staff_reply(self):
+        self.use_real_modes()
+        await self.receive()
+        self.clock += 5
+        await self.flush()
+        cid = conversations.conversation_id_of("zernio", "acc_a", "same-conversation")
+        conversations.dat_che_do(cid, "human")
+        await self.receive(self.sent_event())
+        await self.flush_outgoing()
+        self.assertEqual(self.mode_now(), "human")
+
+    async def test_automation_message_does_not_resume_ai(self):
+        self.use_real_modes()
+        await self.image_handoff()
+        await self.receive(self.sent_event(sent_via="workflow"))
+        await self.flush_outgoing()
+        self.assertEqual(self.mode_now(), "human")
+        self.assertTrue(self.delivery_state().get("auto_handoff"))
+
+    async def test_bot_echo_does_not_resume_ai(self):
+        self.use_real_modes()
+        await self.receive()
+        self.clock += 5
+        await self.flush()
+        self.bot.send_delivery.assert_awaited_once()
+        await self.image_handoff()
+        status, body = await self.receive(self.sent_event(text="answer", sent_via="api"))
+        self.assertEqual(body["status"], "bot_echo")
+        await self.flush_outgoing()
+        self.assertEqual(self.mode_now(), "human")
+        self.assertTrue(self.delivery_state().get("auto_handoff"))
+
+    async def test_staff_reply_wins_over_pending_handoff(self):
+        self.use_real_modes()
+        await self.receive(self.image_event())
+        self.clock += 5
+        with patch.object(conversations, "dat_che_do", side_effect=RuntimeError("simulated crash")):
+            await self.flush()
+        self.assertTrue(self.delivery_state().get("handoff_pending"))
+        await self.receive(self.sent_event())
+        await self.flush_outgoing()
+        self.restart_delivery()
+        await self.flush()
+        self.assertEqual(self.mode_now(), "ai")
+        self.assertFalse(self.delivery_state().get("handoff_pending"))
+
+    async def test_handoff_racing_staff_reply_ends_in_ai(self):
+        """A staff reply resumes AI while the handoff is still writing `human`: AI wins."""
+        self.use_real_modes()
+        await self.receive(self.image_event())
+        self.clock += 5
+        original = conversations.dat_che_do
+        key = z._batch_key("provider-a", "same-conversation")
+        def staff_then_human(cid, mode):
+            if mode == "human":
+                # What `_receive_sent` and `_flush_outgoing` do for a staff reply, landing just before
+                # the handoff's own `human` write.
+                with self.store.transaction() as state:
+                    current = state["conversations"][key]
+                    for field in ("handoff_pending", "auto_handoff"):
+                        current.pop(field, None)
+                original(cid, "ai")
+            return original(cid, mode)
+        with patch.object(conversations, "dat_che_do", side_effect=staff_then_human):
+            await self.flush()
+        self.assertEqual(self.mode_now(), "ai")
+
     def mock_provider(self, status=503, retry_after=None, error=None):
         from types import SimpleNamespace
         client = AsyncMock()

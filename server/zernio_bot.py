@@ -685,10 +685,17 @@ def _receive_sent(state, bot, body, msg, account_id, now, mark_event_handled):
     staff = sent_via not in AUTOMATION_SENDERS
     if staff:
         _staff_answered(current, now)
+    # Staff took over a conversation the bot handed off itself: AI comes back once the pause ends.
+    # A manual takeover in Javis (no `auto_handoff`) stays with staff.
+    resume_ai = staff and bool(current.get("auto_handoff"))
+    if resume_ai:
+        current.pop("auto_handoff", None)
+        current.pop("handoff_pending", None)
+        current["resume_ai_pending"] = True
     state.setdefault("outgoing", {})[out_key] = {
         "account_id": account_id, "conversation_id": conv_id, "javis_account_id": bot.account_id,
         "message": msg, "sent_via": sent_via, "staff": staff, "received_at": now,
-        "due_at": now + OUTGOING_SETTLE_SECONDS}
+        "due_at": now + OUTGOING_SETTLE_SECONDS, "resume_ai": resume_ai}
     _arm_outgoing(out_key, OUTGOING_SETTLE_SECONDS)
     return mark_event_handled(202, "staff_message" if staff else "automation_message")
 
@@ -758,6 +765,10 @@ async def _flush_outgoing(out_key):
                     "created_at": when})
                 if not result.get("ok"):
                     raise RuntimeError("outgoing_inbox_write_failed")
+            if entry.get("resume_ai"):
+                _resume_ai(bot, conv_id)
+                current = state["conversations"].get(_batch_key(entry["account_id"], conv_id)) or {}
+                current.pop("resume_ai_pending", None)
             state["outgoing"].pop(out_key, None)
     except asyncio.CancelledError:
         raise
@@ -942,16 +953,31 @@ def _block_delivery(current, reason):
     current.pop("blocked_reason", None)
 
 
+def _resume_ai(bot, conversation_id):
+    """Switch a conversation back to AI. Raises so the caller retries later."""
+    cid = conversations.conversation_id_of("zernio", bot.account_id, conversation_id)
+    if cid is None:
+        return
+    ok, _ = conversations.dat_che_do(cid, "ai")
+    if not ok:
+        raise RuntimeError("resume_ai_failed")
+
+
 def _complete_handoff(key, bot):
     current = _state_store.load()["conversations"][key]
-    if not current.get("handoff_pending"):
+    if not current.get("handoff_pending") or current.get("resume_ai_pending"):
         return
     cid = conversations.conversation_id_of("zernio", bot.account_id, current["conversation_id"])
     ok, _ = conversations.dat_che_do(cid, "human")
     if not ok:
         raise RuntimeError("delivery_handoff_failed")
     with _state_store.transaction() as state:
-        state["conversations"][key]["handoff_pending"] = False
+        current = state["conversations"][key]
+        # A staff reply cleared the handoff while `human` was being written: staff wins, AI comes back.
+        resumed = not current.get("handoff_pending")
+        current["handoff_pending"] = False
+    if resumed:
+        _resume_ai(bot, current["conversation_id"])
 
 
 async def _flush_locked(key):
