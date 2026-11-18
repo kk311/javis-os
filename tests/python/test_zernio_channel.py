@@ -54,6 +54,37 @@ class ZernioTests(unittest.IsolatedAsyncioTestCase):
         bot.start()
         return bot
 
+    async def test_send_uses_conversation_id_in_url_even_with_connection_id(self):
+        seen = {}
+
+        class FakeResp:
+            status_code = 200
+            headers = {}
+
+            def json(self):
+                return {"data": {"messageId": "m1"}}
+
+        class FakeClient:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, url, json=None, headers=None):
+                seen["url"] = url
+                return FakeResp()
+
+        creds = {"account_id": "acc1", "connection_id": "conn-9", "api_key": "k"}
+        with patch("httpx.AsyncClient", FakeClient):
+            res = await z.send_api_delivery(creds, "conv-42", "hi", "key")
+        self.assertEqual(res["kind"], "accepted")
+        self.assertIn("/inbox/conversations/conv-42/messages", seen["url"])
+        self.assertNotIn("conn-9", seen["url"])
+
     async def asyncTearDown(self):
         for timer in z._TIMERS.values():
             timer.cancel()

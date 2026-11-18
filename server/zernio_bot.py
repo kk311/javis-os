@@ -509,8 +509,8 @@ async def send_api_delivery(creds: dict, conversation_id: str, text: str, idempo
         return {"kind": "blocked", "code": "missing conversation_id or text", "retry_after_seconds": None}
 
     aid = creds.get("account_id") or ""
-    cid = str(creds.get("connection_id") or "")
-    api_key = (connection_api_key(cid) if cid else "") or creds.get("api_key") or (_fallback_api_key() if not cid else "")
+    conn_id = str(creds.get("connection_id") or "")
+    api_key = (connection_api_key(conn_id) if conn_id else "") or creds.get("api_key") or (_fallback_api_key() if not conn_id else "")
     if not api_key:
         return {"kind": "blocked", "code": "missing_api_key", "retry_after_seconds": None}
 
