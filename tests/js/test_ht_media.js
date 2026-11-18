@@ -93,6 +93,34 @@ const cr = fs.readFileSync(path.join(__dirname, "../../dashboard/chat-render.js"
 check("lightbox mở ảnh trang khác không gửi referrer (CDN Zalo chặn)", /img\.referrerPolicy = "no-referrer"/.test(cr));
 
 console.log();
+
+// ---- Zernio (Instagram): metadata.attachments, chi hien link (owner 2026-11-18) ----
+const CDN = "https://lookaside.fbsbx.com/ig_messaging_cdn/?asset_id=1&signature=SIG";
+p = M.phanTich({ message_type: "image", text: "[\u1ea2nh]", sender_type: "customer",
+                 metadata: { attachments: [{ type: "image", url: CDN, payload: { url: CDN } }] } });
+check("zernio anh: hien thang tu link", p.anh === CDN && p.chu === "", JSON.stringify(p));
+p = M.phanTich({ message_type: "text", text: "", metadata: { attachments: [{ type: "image", url: CDN }] } });
+check("zernio anh cu (text rong, type text): van hien anh", p.anh === CDN, JSON.stringify(p));
+p = M.phanTich({ message_type: "image", text: "[B\u00e0i \u0111\u0103ng] Kem ELF",
+                 metadata: { attachments: [{ type: "share", originalType: "ig_post", url: CDN,
+                   payload: { ig_post_media_id: "1", title: "Kem ELF\n\nsale 200k", url: CDN } }] } });
+check("zernio bai dang: anh bai + caption", p.anh === CDN && p.chu === "B\u00e0i \u0111\u0103ng: Kem ELF sale 200k", JSON.stringify(p));
+p = M.phanTich({ message_type: "image", text: "[Story]",
+                 metadata: { attachments: [{ type: "share", originalType: "ig_story", url: CDN, payload: { story_media_url: CDN } }] } });
+check("zernio story: the link", p.lien && p.lien.href === CDN && p.lien.ten === "Story" && p.chu === "", JSON.stringify(p));
+h = M.html(p, esc, ic, tw);
+check("zernio story: html la the link, khong tai ve", h.indexOf('href="' + CDN.replace(/&/g, "&amp;") + '"') > 0 && h.indexOf("download") < 0, h);
+p = M.phanTich({ message_type: "video", text: "[Reel] Ch\u00ec",
+                 metadata: { attachments: [{ type: "video", originalType: "ig_reel", url: "https://www.instagram.com/reel/x/", payload: { title: "Ch\u00ec k\u1ebb m\u00f4i" } }] } });
+check("zernio reel: link + caption", p.lien && p.lien.href === "https://www.instagram.com/reel/x/" && p.lien.phu === "Ch\u00ec k\u1ebb m\u00f4i", JSON.stringify(p));
+p = M.phanTich({ message_type: "image", text: "M\u1eabu n\u00e0y c\u00f2n kh\u00f4ng",
+                 metadata: { attachments: [{ type: "share", originalType: "ig_post", url: CDN, payload: { title: "Kem" } }] } });
+check("zernio: loi khach go duoc giu", p.chu === "M\u1eabu n\u00e0y c\u00f2n kh\u00f4ng", p.chu);
+p = M.phanTich({ message_type: "image", text: "", metadata: { attachments: [{ type: "image", url: "javascript:alert(1)" }] } });
+check("zernio: link khong https bi bo", !p.anh && !p.lien, JSON.stringify(p));
+p = M.phanTich({ message_type: "other", text: "[Tin m\u1eabu]", metadata: { attachments: [{ type: "template", payload: {} }] } });
+check("zernio template: khong anh, khong link", !p.anh && !p.lien && !p.file, JSON.stringify(p));
+
 if (fails.length) {
   console.log("ĐỎ " + fails.length + " mục: " + fails.join(", "));
   process.exit(1);

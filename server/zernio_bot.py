@@ -48,6 +48,17 @@ MAX_AGE_SECONDS = 48 * 3600  # 48 hours for deduplication TTL
 BATCH_SECONDS = 5.0
 API_BASE = "https://zernio.com/api/v1"
 MAX_BODY_BYTES = 256 * 1024
+# Owner 2026-11-18: once staff answers a customer (Instagram app, Zernio dashboard, Javis inbox), the bot
+# stays quiet this long. Customer messages that arrive meanwhile wait; if staff still has not answered when
+# the pause ends, the bot answers them.
+STAFF_PAUSE_SECONDS = 300.0
+# A `message.sent` echo is written to the inbox after this delay, so a send from the Javis inbox (which
+# writes its own row right after the API call returns) is matched instead of stored twice.
+OUTGOING_SETTLE_SECONDS = 8.0
+# How long a bot reply is remembered to recognise its own `message.sent` echo.
+BOT_ECHO_WINDOW = 3600.0
+# Zernio automations, not a person: stored in the inbox but they never pause the bot.
+AUTOMATION_SENDERS = {"broadcast", "sequence", "workflow", "comment_automation", "bulk-api"}
 
 
 
@@ -490,7 +501,19 @@ def _receive_webhook(raw, headers, state):
     if event_name == "webhook.test" or body.get("test") is True:
         return mark_event_handled(200, "test")
 
-    # 5. Handle non-message events
+    # 5. Messages the shop account sent (staff, bot echo, automations)
+    if event_name == "message.sent":
+        msg = body.get("message") or {}
+        if not isinstance(msg, dict):
+            return 400, {"ok": False, "error": "invalid_message"}
+        platform = str(acc_obj.get("platform") or msg.get("platform") or "").lower()
+        if acc_obj.get("username") and str(acc_obj["username"]).lstrip("@").casefold() != bot.bot_username.lstrip("@").casefold():
+            return 400, {"ok": False, "error": "account_username_mismatch"}
+        if platform != "instagram":
+            return mark_event_handled(202, "unsupported_platform")
+        return _receive_sent(state, bot, body, msg, account_id, now, mark_event_handled)
+
+    # 6. Handle other non-message events
     if event_name != "message.received":
         return mark_event_handled(202, "ignored_event")
 
@@ -551,24 +574,48 @@ def _batch_key(provider_id, conversation_id):
     return json.dumps([provider_id, conversation_id], separators=(",", ":"))
 
 
-def _record_inbox(bot, conversation_id, message):
-    sender = message.get("sender") or {}
-    result = conversations.ghi_su_kien({
-        "channel": "zernio", "account_id": bot.account_id,
-        "account_name": bot.bot_username, "bot_id": str(bot.bot_id),
-        "external_chat_id": conversation_id, "chat_type": "private",
-        "chat_title": str(sender.get("name") or sender.get("username") or sender.get("id") or conversation_id),
-        "external_message_id": message.get("platformMessageId") or message.get("id"),
-        "sender_type": "customer", "sender_id": str(sender.get("id") or ""),
-        "sender_name": str(sender.get("name") or sender.get("username") or ""),
-        "message_type": "text", "text": str(message.get("text") or ""),
-        "metadata": {"attachments": message.get("attachments") or [], "provider_account_id": bot.provider_account_id},
-        "created_at": _now()})
-    if not result.get("ok"):
-        raise RuntimeError("inbox_write_failed")
+def _norm_text(text) -> str:
+    return " ".join(str(text or "").split())
 
 
-def _enqueue(state, bot, conversation_id, messages, now):
+def _clip(text, n=300) -> str:
+    text = str(text or "").strip()
+    return text if len(text) <= n else text[:n].rstrip() + "..."
+
+
+def media_kind(attachments) -> Tuple[str, str]:
+    """(message_type, short label) of Zernio attachments for the inbox. Display only, never sent to the model.
+
+    Instagram/Facebook shapes seen live 2026-11-17: image, video, share/ig_post (caption in payload.title),
+    share/ig_story, video/ig_reel (caption in payload.title), template (empty generic card)."""
+    items = [a for a in (attachments or []) if isinstance(a, dict)]
+    if not items:
+        return "text", ""
+    first = items[0]
+    kind = str(first.get("type") or "").lower()
+    original = str(first.get("originalType") or "").lower()
+    payload = first.get("payload") if isinstance(first.get("payload"), dict) else {}
+    caption = _clip(payload.get("title"))
+    if original.endswith("_post") or (kind == "share" and caption):
+        return "image", "[Bài đăng]" + (" " + caption if caption else "")
+    if original.endswith("_story"):
+        return "image", "[Story]"
+    if original.endswith("_reel"):
+        return "video", "[Reel]" + (" " + caption if caption else "")
+    if kind == "image":
+        return "image", "[Ảnh]" if len(items) == 1 else f"[{len(items)} ảnh]"
+    if kind == "video":
+        return "video", "[Video]"
+    if kind == "audio":
+        return "audio", "[Ghi âm]"
+    if kind == "template":
+        return "other", "[Tin mẫu]"
+    if kind == "file":
+        return "file", "[Tệp]"
+    return "other", "[Đính kèm]"
+
+
+def _conversation_state(state, bot, conversation_id):
     key = _batch_key(bot.provider_account_id, conversation_id)
     current = state["conversations"].setdefault(key, {
         "messages": [], "account_id": bot.provider_account_id, "conversation_id": conversation_id,
@@ -579,6 +626,167 @@ def _enqueue(state, bot, conversation_id, messages, now):
         current = {"messages": [], "account_id": bot.provider_account_id, "conversation_id": conversation_id,
                    "javis_account_id": bot.account_id, "bot_id": bot.bot_id}
         state["conversations"][key] = current
+    return key, current
+
+
+def _is_bot_echo(current, text, now) -> bool:
+    """True (and forgets the entry) when an outgoing message is one of the bot's own replies."""
+    echo = _norm_text(text)
+    sent = [e for e in current.get("bot_sent", []) if now - float(e.get("ts") or 0) < BOT_ECHO_WINDOW]
+    current["bot_sent"] = sent
+    if not echo:
+        return False
+    for i, entry in enumerate(sent):
+        mine = entry.get("t") or ""
+        # Equal, or one part of a long reply Instagram split in several messages.
+        if echo == mine or (len(echo) >= 20 and echo in mine):
+            if echo == mine:
+                sent.pop(i)
+            return True
+    return False
+
+
+def _staff_answered(current, now):
+    """Staff answered: what the customer wrote so far is handled, the bot pauses."""
+    current["staff_until"] = max(float(current.get("staff_until") or 0), now + STAFF_PAUSE_SECONDS)
+    current["staff_at"] = now
+    # Pending customer messages are already in the inbox; staff answered them.
+    current["messages"] = []
+    # A reply the bot is still preparing or retrying is dropped. A batch already archived for staff
+    # (delivery_batch / handoff_pending) keeps its evidence untouched.
+    if current.get("processing") and not current.get("delivery_batch") and not current.get("handoff_pending"):
+        for field in ("processing", "reply", "reply_created_at", "send_key", "attempts", "next_retry_at",
+                      "delivery_issue"):
+            current.pop(field, None)
+
+
+def _receive_sent(state, bot, body, msg, account_id, now, mark_event_handled):
+    """`message.sent`: a message the shop account sent (bot, staff in the Instagram app, Zernio, Javis)."""
+    direction = str(msg.get("direction") or "outgoing").lower()
+    if direction != "outgoing":
+        return mark_event_handled(202, "ignored_direction")
+    meta_obj = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    if meta_obj.get("historical") or msg.get("historical") or msg.get("isHistorical"):
+        return mark_event_handled(202, "standby_or_historical")
+    platform_msg_id = str(msg.get("platformMessageId") or msg.get("id") or "").strip()
+    conv_obj = body.get("conversation") if isinstance(body.get("conversation"), dict) else {}
+    conv_id = str(conv_obj.get("id") or msg.get("conversationId") or "").strip()
+    if not platform_msg_id or not conv_id:
+        return mark_event_handled(400, "invalid_message")
+    out_key = _batch_key(account_id, "out:" + platform_msg_id)
+    if out_key in state["messages"]:
+        return mark_event_handled(200, "duplicate_message")
+    state["messages"][out_key] = {"ts": now}
+    _key, current = _conversation_state(state, bot, conv_id)
+    if _is_bot_echo(current, msg.get("text"), now):
+        return mark_event_handled(202, "bot_echo")
+    sent_via = msg.get("sentVia")
+    sent_via = str(sent_via).strip().lower() if sent_via else ""
+    staff = sent_via not in AUTOMATION_SENDERS
+    if staff:
+        _staff_answered(current, now)
+    state.setdefault("outgoing", {})[out_key] = {
+        "account_id": account_id, "conversation_id": conv_id, "javis_account_id": bot.account_id,
+        "message": msg, "sent_via": sent_via, "staff": staff, "received_at": now,
+        "due_at": now + OUTGOING_SETTLE_SECONDS}
+    _arm_outgoing(out_key, OUTGOING_SETTLE_SECONDS)
+    return mark_event_handled(202, "staff_message" if staff else "automation_message")
+
+
+def _arm_outgoing(out_key, delay_seconds):
+    timer_key = "out|" + out_key
+    previous = _TIMERS.pop(timer_key, None)
+    if previous:
+        previous.cancel()
+    loop = asyncio.get_running_loop()
+    _TIMERS[timer_key] = loop.call_later(max(0, delay_seconds), lambda: asyncio.create_task(_flush_outgoing(out_key)))
+
+
+def _sent_at(msg, fallback):
+    try:
+        import datetime
+        return datetime.datetime.fromisoformat(str(msg.get("sentAt") or "").replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return fallback
+
+
+async def _flush_outgoing(out_key):
+    _TIMERS.pop("out|" + out_key, None)
+    try:
+        with _state_store.transaction() as state:
+            entry = (state.get("outgoing") or {}).get(out_key)
+            if not entry:
+                return
+            bot = _REGISTRY.get(entry["account_id"])
+            if not bot or bot._stop:
+                return
+            msg = entry["message"]
+            conv_id = entry["conversation_id"]
+            text = str(msg.get("text") or "")
+            pmid = str(msg.get("platformMessageId") or msg.get("id") or "")
+            echo = _norm_text(text)
+            when = _sent_at(msg, entry.get("received_at") or _now())
+            stored = False
+            if echo:
+                # A send from the Javis inbox or the bot already wrote its own row: give it the id, no copy.
+                for row in conversations.own_messages_between(
+                        "zernio", bot.account_id, conv_id, when - 180, _now() + 5):
+                    if _norm_text(row.get("text")) != echo:
+                        continue
+                    ext = str(row.get("external_message_id") or "")
+                    if not ext:
+                        conversations.set_message_id(int(row["id"]), pmid)
+                        stored = True
+                        break
+                    if ext.startswith("zernio-") or ext == pmid:
+                        stored = True
+                        break
+            if not stored:
+                attachments = msg.get("attachments") if isinstance(msg.get("attachments"), list) else []
+                message_type, label = media_kind(attachments)
+                via = entry.get("sent_via") or ""
+                result = conversations.ghi_su_kien({
+                    "channel": "zernio", "account_id": bot.account_id,
+                    "account_name": bot.bot_username, "bot_id": str(bot.bot_id),
+                    "external_chat_id": conv_id, "chat_type": "private",
+                    "external_message_id": pmid, "sender_type": "human",
+                    "sender_name": "Nhân viên" if entry.get("staff") else "Tự động Zernio",
+                    "message_type": message_type, "text": text.strip() or label,
+                    "metadata": {"attachments": attachments, "provider_account_id": bot.provider_account_id,
+                                 "sent_via": via, "source": "zernio_message_sent",
+                                 "staff": bool(entry.get("staff"))},
+                    "created_at": when})
+                if not result.get("ok"):
+                    raise RuntimeError("outgoing_inbox_write_failed")
+            state["outgoing"].pop(out_key, None)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        print(f"[zernio outgoing] {type(exc).__name__}", file=sys.stderr)
+        _arm_outgoing(out_key, 30)
+
+
+def _record_inbox(bot, conversation_id, message):
+    sender = message.get("sender") or {}
+    attachments = message.get("attachments") if isinstance(message.get("attachments"), list) else []
+    message_type, label = media_kind(attachments)
+    result = conversations.ghi_su_kien({
+        "channel": "zernio", "account_id": bot.account_id,
+        "account_name": bot.bot_username, "bot_id": str(bot.bot_id),
+        "external_chat_id": conversation_id, "chat_type": "private",
+        "chat_title": str(sender.get("name") or sender.get("username") or sender.get("id") or conversation_id),
+        "external_message_id": message.get("platformMessageId") or message.get("id"),
+        "sender_type": "customer", "sender_id": str(sender.get("id") or ""),
+        "sender_name": str(sender.get("name") or sender.get("username") or ""),
+        "message_type": message_type, "text": str(message.get("text") or "").strip() or label,
+        "metadata": {"attachments": attachments, "provider_account_id": bot.provider_account_id},
+        "created_at": _now()})
+    if not result.get("ok"):
+        raise RuntimeError("inbox_write_failed")
+
+
+def _enqueue(state, bot, conversation_id, messages, now):
+    key, current = _conversation_state(state, bot, conversation_id)
     added = False
     for message in messages:
         msg_id = str(message.get("platformMessageId") or message["id"])
@@ -620,7 +828,11 @@ def resume_pending(provider_id):
             current.pop("takeover", None)
             current.pop("replies_in_window", None)
             state["conversations"][key] = state["conversations"].pop(old_key)
-    for key, current in _state_store.load()["conversations"].items():
+    snapshot = _state_store.load()
+    for out_key, entry in (snapshot.get("outgoing") or {}).items():
+        if entry.get("account_id") == provider_id:
+            _arm_outgoing(out_key, max(0, float(entry.get("due_at") or 0) - _now()))
+    for key, current in snapshot["conversations"].items():
         if current.get("account_id") == provider_id:
             if current.get("handoff_pending"):
                 _arm_timer(key, 0)
@@ -748,6 +960,11 @@ async def _flush_locked(key):
                 return
             if not current.get("messages"):
                 return
+            pause = float(current.get("staff_until") or 0) - _now()
+            if pause > 0:
+                # Staff answered recently: hold the customer's new messages until the pause ends.
+                _arm_timer(key, pause)
+                return
             current["processing"] = current["messages"]
             current["messages"] = []
         batch = current["processing"]
@@ -806,6 +1023,11 @@ async def _flush_locked(key):
                         return
                     attempt = current.get("attempts", 0)
                     current["attempts"] = attempt + 1
+                    # Remember the text before HTTP so its `message.sent` echo is not taken for staff.
+                    current["bot_sent"] = [e for e in current.get("bot_sent", [])
+                                           if _now() - float(e.get("ts") or 0) < BOT_ECHO_WINDOW][-19:]
+                    if not any(e.get("t") == _norm_text(reply) for e in current["bot_sent"]):
+                        current["bot_sent"].append({"t": _norm_text(reply), "ts": _now()})
                     # Persist a retry guard before HTTP too, including crash during send.
                     current["next_retry_at"] = min(
                         _now() + retry_delay(attempt, None, random.random()),

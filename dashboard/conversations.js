@@ -2357,7 +2357,7 @@
     // it used to read "image https://...zdn.vn/....jpg". Any non-text message goes through the same parser.
     var wantMedia = t.sender_type === "customer" || (t.message_type && t.message_type !== "text");
     var media = (wantMedia && window.JavisHtMedia) ? window.JavisHtMedia.phanTich(t, t.conversation_id) : null;
-    var coMedia = !!(media && (media.anh || media.file));
+    var coMedia = !!(media && (media.anh || media.file || media.lien));
     if (coMedia) {
       than = window.JavisHtMedia.html(media, esc, ic, window.t) + (media.chu ? '<div class="ht-chu-thich">' + esc(media.chu) + '</div>' : "");
     } else if (t.sender_type === "ai" && window.mdToHtml) {

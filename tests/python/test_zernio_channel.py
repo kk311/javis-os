@@ -703,5 +703,146 @@ sys.stdin.read()
         self.assertIn("/webhooks/zernio", bot_shield.MACHINE_EXACT)
 
 
+    # ---- message.sent: staff replies, bot echo, pause (owner 2026-11-18) ----
+    def sent_event(self, event_id="s1", message_id="out1", conv="same-conversation", text=None,
+                   sent_via=None, attachments=None):
+        # The inbox database is shared by the whole file: a text unique per test keeps matching honest.
+        text = "staff answer " + self._testMethodName if text is None else text
+        return {"id": event_id, "event": "message.sent",
+                "timestamp": datetime.datetime.fromtimestamp(self.clock, datetime.timezone.utc).isoformat(),
+                "account": {"id": self.bot.provider_account_id, "username": self.bot.bot_username, "platform": "instagram"},
+                "conversation": {"id": conv},
+                "message": {"id": message_id, "platformMessageId": message_id, "conversationId": conv,
+                            "platform": "instagram", "direction": "outgoing", "text": text,
+                            "attachments": attachments or [], "sentVia": sent_via,
+                            "sender": {"id": self.bot.provider_account_id, "username": self.bot.bot_username}}}
+
+    async def flush_outgoing(self):
+        for out_key in list((self.store.load().get("outgoing") or {})):
+            await z._flush_outgoing(out_key)
+
+    def staff_rows(self):
+        return [e for e in self.inbox if e.get("sender_type") == "human"]
+
+    async def test_staff_reply_is_stored_and_pauses_bot(self):
+        status, body = await self.receive(self.sent_event())
+        self.assertEqual((status, body["status"]), (202, "staff_message"))
+        await self.flush_outgoing()
+        rows = self.staff_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["text"], rows[0]["external_message_id"], rows[0]["sender_name"]),
+                         ("staff answer test_staff_reply_is_stored_and_pauses_bot", "out1", "Nhân viên"))
+        self.assertFalse(self.store.load().get("outgoing"))
+        # Customer writes during the pause: bot waits.
+        self.clock += 60
+        await self.receive(self.event("e2", "m2"))
+        self.clock += 5
+        await self.flush()
+        self.bot.answer_fn.assert_not_awaited()
+        # Pause over and staff did not answer: bot answers.
+        self.clock = self.clock - 65 + z.STAFF_PAUSE_SECONDS + 1
+        await self.flush()
+        self.bot.answer_fn.assert_awaited_once()
+
+    async def test_staff_reply_answers_pending_customer_messages(self):
+        await self.receive()
+        self.clock += 2
+        await self.receive(self.sent_event())
+        self.clock += z.STAFF_PAUSE_SECONDS + 10
+        await self.flush()
+        self.bot.answer_fn.assert_not_awaited()
+        self.bot.send_delivery.assert_not_awaited()
+
+    async def test_staff_reply_during_model_call_drops_bot_reply(self):
+        async def answer(text, meta, _):
+            await self.receive(self.sent_event())
+            return {"text": "late bot answer"}
+        self.bot.answer_fn = AsyncMock(side_effect=answer)
+        await self.receive()
+        self.clock += 5
+        await self.flush()
+        self.bot.answer_fn.assert_awaited_once()
+        self.bot.send_delivery.assert_not_awaited()
+        self.assertFalse(self.store.load()["conversations"][z._batch_key("provider-a", "same-conversation")].get("processing"))
+
+    async def test_bot_echo_is_not_staff(self):
+        await self.receive()
+        self.clock += 5
+        await self.flush()
+        self.bot.send_delivery.assert_awaited_once()
+        status, body = await self.receive(self.sent_event(text=" answer ", sent_via="api"))
+        self.assertEqual(body["status"], "bot_echo")
+        await self.flush_outgoing()
+        self.assertFalse(self.staff_rows())
+        # No pause: next customer message is answered normally.
+        self.clock += 10
+        await self.receive(self.event("e2", "m2"))
+        self.clock += 5
+        await self.flush()
+        self.assertEqual(self.bot.answer_fn.await_count, 2)
+
+    async def test_javis_inbox_send_is_not_stored_twice(self):
+        conversations.ghi_su_kien({"channel": "zernio", "account_id": "acc_a", "bot_id": "bot_a",
+                                   "external_chat_id": "same-conversation", "chat_type": "private",
+                                   "sender_type": "human", "sender_name": "Bạn",
+                                   "text": "staff answer test_javis_inbox_send_is_not_stored_twice",
+                                   "created_at": self.clock})
+        before = len(self.staff_rows())
+        await self.receive(self.sent_event(sent_via="api"))
+        await self.flush_outgoing()
+        self.assertEqual(len(self.staff_rows()), before)
+        self.assertEqual(conversations.known_message_ids("zernio", "acc_a", "same-conversation", ["out1"]), {"out1"})
+
+    async def test_automation_message_stored_without_pause(self):
+        status, body = await self.receive(self.sent_event(text="shop gửi inbox ạ (test)", sent_via="comment_automation"))
+        self.assertEqual(body["status"], "automation_message")
+        await self.flush_outgoing()
+        self.assertEqual(self.staff_rows()[0]["sender_name"], "Tự động Zernio")
+        await self.receive(self.event("e2", "m2"))
+        self.clock += 5
+        await self.flush()
+        self.bot.answer_fn.assert_awaited_once()
+
+    async def test_sent_duplicates_and_bad_direction(self):
+        await self.receive(self.sent_event())
+        _, body = await self.receive(self.sent_event(event_id="s2"))
+        self.assertEqual(body["status"], "duplicate_message")
+        event = self.sent_event(event_id="s3", message_id="out3")
+        event["message"]["direction"] = "incoming"
+        self.assertEqual((await self.receive(event))[1]["status"], "ignored_direction")
+
+    async def test_outgoing_survives_restart(self):
+        await self.receive(self.sent_event())
+        for timer in z._TIMERS.values():
+            timer.cancel()
+        z._TIMERS.clear()
+        z.resume_pending("provider-a")
+        self.assertTrue(any(k.startswith("out|") for k in z._TIMERS))
+        await self.flush_outgoing()
+        self.assertEqual(len(self.staff_rows()), 1)
+
+    async def test_customer_media_labels(self):
+        sig = "https://lookaside.fbsbx.com/ig_messaging_cdn/?asset_id=1&signature=SIG"
+        cases = [
+            ([{"type": "image", "url": sig}], ("image", "[Ảnh]")),
+            ([{"type": "share", "originalType": "ig_post", "url": sig,
+               "payload": {"ig_post_media_id": "1", "title": "Kem má hồng ELF sale", "url": sig}}],
+             ("image", "[Bài đăng] Kem má hồng ELF sale")),
+            ([{"type": "share", "originalType": "ig_story", "url": sig, "payload": {"story_media_url": sig}}],
+             ("image", "[Story]")),
+            ([{"type": "video", "originalType": "ig_reel", "url": "https://www.instagram.com/reel/x/",
+               "payload": {"title": "Chì kẻ môi"}}], ("video", "[Reel] Chì kẻ môi")),
+            ([{"type": "template", "payload": {"generic": {"elements": []}}}], ("other", "[Tin mẫu]")),
+            ([], ("text", "")),
+        ]
+        for attachments, expected in cases:
+            self.assertEqual(z.media_kind(attachments), expected)
+        event = self.event()
+        event["message"]["text"] = ""
+        event["message"]["attachments"] = cases[1][0]
+        await self.receive(event)
+        self.assertEqual((self.inbox[-1]["message_type"], self.inbox[-1]["text"]), ("image", "[Bài đăng] Kem má hồng ELF sale"))
+
+
 if __name__ == "__main__":
     unittest.main()
