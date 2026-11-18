@@ -909,6 +909,25 @@ def resolve_delivery_issue(account_id: str, issue_id: str, revision: int) -> int
         guard.close()
 
 
+_BATCH_FIELDS = ("processing", "reply", "reply_created_at", "send_key", "attempts", "next_retry_at")
+
+
+def _has_media(messages) -> bool:
+    return any(message.get("attachments") for message in messages or [])
+
+
+def _handoff(current):
+    """The bot steps aside for staff: drop the batch (it already lives in the inbox), no issue.
+
+    `auto_handoff` marks that the bot chose this, so the next staff reply switches AI back on.
+    """
+    for field in _BATCH_FIELDS + ("delivery_issue", "delivery_batch", "blocked_reason"):
+        current.pop(field, None)
+    current["messages"] = []
+    current["handoff_pending"] = True
+    current["auto_handoff"] = True
+
+
 def _block_delivery(current, reason):
     """Commit handoff intent and evidence before touching the inbox database."""
     current["delivery_batch"] = {field: current.pop(field) for field in
@@ -961,7 +980,8 @@ async def _flush_locked(key):
             if not current.get("messages"):
                 return
             pause = float(current.get("staff_until") or 0) - _now()
-            if pause > 0:
+            # Media goes to staff at once, even during a staff pause: it never waits for the model.
+            if pause > 0 and not _has_media(current["messages"]):
                 # Staff answered recently: hold the customer's new messages until the pause ends.
                 _arm_timer(key, pause)
                 return
@@ -972,11 +992,11 @@ async def _flush_locked(key):
         reply = current.get("reply")
         send_key = current.setdefault("send_key", "zernio-" + hashlib.sha256((key + json.dumps([m.get("platformMessageId") or m["id"] for m in batch])).encode()).hexdigest())
 
-        # This channel has no media reader. Preserve the whole batch for staff
-        # before any model call, including captions and albums.
-        unsupported_media = any(message.get("attachments") for message in batch)
+        # This channel has no media reader. Hand the whole batch to staff before any
+        # model call, including captions and albums; the inbox already holds it.
+        unsupported_media = _has_media(batch)
         if unsupported_media:
-            _block_delivery(current, "unsupported_media")
+            _handoff(current)
 
     if unsupported_media:
         _complete_handoff(key, bot)

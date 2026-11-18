@@ -359,24 +359,39 @@ class ZernioTests(unittest.IsolatedAsyncioTestCase):
         z._state_store = z.DurableState(self.store.file_path)
         self.bot.start()
 
-    async def test_image_only_handoffs_once(self):
-        event = self.event("image-event", "image-message", text="")
+    def assert_auto_handoff(self, current):
+        for field in ("delivery_issue", "delivery_batch", "processing", "send_key"):
+            self.assertNotIn(field, current)
+        self.assertTrue(current.get("auto_handoff"))
+        self.assertFalse(current.get("handoff_pending"))
+        cid = conversations.conversation_id_of("zernio", "acc_a", "same-conversation")
+        self.assertEqual(conversations.chi_tiet(cid)["mode"], "human")
+
+    def use_real_modes(self):
+        """Read the real conversation mode, starting from AI (the inbox database is shared by the file)."""
+        self.mode_patch.stop()
+        cid = conversations.conversation_id_of("zernio", "acc_a", "same-conversation")
+        if cid:
+            conversations.dat_che_do(cid, "ai")
+
+    def image_event(self, event_id="image-event", message_id="image-message", text=""):
+        event = self.event(event_id, message_id, text=text)
         event["message"]["attachments"] = [{"type": "image", "url": "https://example.invalid/photo.jpg"}]
+        return event
+
+    async def test_image_only_handoffs_once(self):
+        event = self.image_event()
         self.assertEqual((await self.receive(event))[0], 202)
         saved = conversations.tin_theo_id("zernio", "acc_a", "same-conversation", "image-message")
         self.assertEqual(saved["metadata"]["attachments"], event["message"]["attachments"])
         self.clock += 5
         await self.flush()
-        current = self.delivery_state()
-        self.assertEqual(current.get("delivery_issue", {}).get("reason"), "unsupported_media")
-        cid = conversations.conversation_id_of("zernio", "acc_a", "same-conversation")
-        self.assertEqual(conversations.chi_tiet(cid)["mode"], "human")
-        self.assertEqual(current["delivery_batch"]["processing"], [event["message"]])
+        self.assert_auto_handoff(self.delivery_state())
         self.assertEqual((await self.receive(event))[1].get("duplicate"), True)
         event["id"] = "replayed-with-new-event-id"
         self.assertEqual((await self.receive(event))[1]["status"], "duplicate_message")
         await self.flush()
-        self.assertEqual(self.delivery_state()["delivery_issue"], current["delivery_issue"])
+        self.assert_auto_handoff(self.delivery_state())
         self.assertEqual(len(self.inbox), 1)
         self.bot.answer_fn.assert_not_awaited()
         self.bot.send_delivery.assert_not_awaited()
@@ -392,11 +407,8 @@ class ZernioTests(unittest.IsolatedAsyncioTestCase):
         await self.receive(album)
         self.clock += 5
         await self.flush()
-        current = self.delivery_state()
-        self.assertEqual(current.get("delivery_issue", {}).get("reason"), "unsupported_media")
-        self.assertEqual(current["delivery_batch"]["processing"], [first["message"], album["message"]])
-        cid = conversations.conversation_id_of("zernio", "acc_a", "same-conversation")
-        self.assertEqual(conversations.chi_tiet(cid)["mode"], "human")
+        self.assert_auto_handoff(self.delivery_state())
+        self.assertEqual(self.delivery_state()["messages"], [])
         for event in (first, album):
             saved = conversations.tin_theo_id("zernio", "acc_a", "same-conversation", event["message"]["id"])
             self.assertEqual(saved["text"], event["message"]["text"])
@@ -406,8 +418,7 @@ class ZernioTests(unittest.IsolatedAsyncioTestCase):
         self.bot.send_delivery.assert_not_awaited()
 
     async def test_media_handoff_survives_restart(self):
-        event = self.event("restart-media-event", "restart-media-message", text="Please inspect this")
-        event["message"]["attachments"] = [{"type": "image", "url": "https://example.invalid/photo.jpg"}]
+        event = self.image_event("restart-media-event", "restart-media-message", text="Please inspect this")
         await self.receive(event)
         self.restart_delivery()
         self.clock += 5
@@ -415,21 +426,28 @@ class ZernioTests(unittest.IsolatedAsyncioTestCase):
             await self.flush()
         current = self.delivery_state()
         self.assertTrue(current.get("handoff_pending"))
-        self.assertEqual(current["delivery_issue"]["reason"], "unsupported_media")
+        self.assertTrue(current.get("auto_handoff"))
+        self.assertNotIn("delivery_issue", current)
         self.restart_delivery()
         await self.flush()
-        self.assertFalse(self.delivery_state()["handoff_pending"])
-        self.assertEqual(self.delivery_state()["delivery_issue"], current["delivery_issue"])
-        self.assertEqual(self.delivery_state()["delivery_batch"], current["delivery_batch"])
+        self.assert_auto_handoff(self.delivery_state())
         self.restart_delivery()
         self.assertEqual((await self.receive(event))[1].get("duplicate"), True)
-        await self.receive(self.event("later", "later-message", text="Anyone there?"))
+        self.bot.answer_fn.assert_not_awaited()
+        self.bot.send_delivery.assert_not_awaited()
+
+    async def test_image_during_staff_pause_still_handoffs(self):
+        self.use_real_modes()
+        await self.receive(self.sent_event())
+        await self.flush_outgoing()
+        self.clock += 60
+        await self.receive(self.image_event())
         self.clock += 5
         await self.flush()
-        cid = conversations.conversation_id_of("zernio", "acc_a", "same-conversation")
-        self.assertEqual(conversations.chi_tiet(cid)["mode"], "human")
-        self.assertTrue(conversations.tin_theo_id("zernio", "acc_a", "same-conversation", "later-message"))
-        self.assertEqual(self.delivery_state()["delivery_issue"], current["delivery_issue"])
+        self.assert_auto_handoff(self.delivery_state())
+        self.clock += z.STAFF_PAUSE_SECONDS
+        await self.flush()
+        self.assertEqual(conversations.che_do("zernio", "acc_a", "same-conversation"), "human")
         self.bot.answer_fn.assert_not_awaited()
         self.bot.send_delivery.assert_not_awaited()
 
