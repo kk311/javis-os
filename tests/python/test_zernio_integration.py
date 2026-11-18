@@ -197,7 +197,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(seen),2)  # retry reuses journaled model output
                 unknown = self.event('unassigned','unassigned',bot=bots[0])
                 unknown['account']['id'] = 'not-assigned'
-                self.assertEqual((await self.receive(unknown,bots[0].secret))[0],404)
+                self.assertEqual((await self.receive(unknown,bots[0].secret))[0],202)
                 self.assertEqual(len(seen),2)
             finally:
                 for key in configs:
@@ -314,6 +314,13 @@ console.log('Node bridge accepted durable Python runtime ACK, sent no DM');
                 self.assertEqual(response.status_code,expected,response.text)
                 self.assertNotIn(self.bot.secret,response.text)
                 self.assertNotIn('private-key',response.text)
+            with patch.object(z,'handle_webhook',AsyncMock(side_effect=RuntimeError('db locked'))):
+                response = client.post('/webhooks/zernio',content=raw,headers={'X-Zernio-Signature':signature})
+                self.assertEqual(response.status_code,503,response.text)
+                self.assertEqual(response.headers.get('retry-after'),str(z.RETRY_AFTER_SECONDS))
+            with patch.object(z,'handle_webhook',AsyncMock(return_value=(503,{'ok':False,'error':'account_starting','retry_after':30}))):
+                response = client.post('/webhooks/zernio',content=raw,headers={'X-Zernio-Signature':signature})
+                self.assertEqual((response.status_code,response.headers.get('retry-after')),(503,'30'))
             payload = {'conversationId':'adapter-http','account':{'id':'provider-a'},'messages':[self.event()['message']]}
             for token in ['', 'wrong']:
                 with patch.dict(os.environ,{'ZERNIO_ADAPTER_TOKEN':token,'ZERNIO_ADAPTER_ACCOUNT_ID':'provider-a'}):

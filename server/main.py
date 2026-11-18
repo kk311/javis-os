@@ -29177,7 +29177,14 @@ async def zernio_webhook(request: Request):
     raw = await _read_capped_body(request, limit=zernio_bot.MAX_BODY_BYTES)
     if raw is None:
         return PlainTextResponse("too large", status_code=413)
-    status, res = await zernio_bot.handle_webhook(raw, dict(request.headers))
+    try:
+        status, res = await zernio_bot.handle_webhook(raw, dict(request.headers))
+    except Exception as e:  # noqa: BLE001 - a temporary fault must be retried by Zernio, so 5xx not 4xx
+        print(f"[zernio webhook] {type(e).__name__}: {e}", file=sys.stderr)
+        return JSONResponse({"ok": False, "error": "temporary_failure"}, status_code=503,
+                            headers={"Retry-After": str(zernio_bot.RETRY_AFTER_SECONDS)})
+    if status == 503:
+        return JSONResponse(res, status_code=503, headers={"Retry-After": str(res.get("retry_after") or zernio_bot.RETRY_AFTER_SECONDS)})
     if status == 401:
         return PlainTextResponse("bad signature", status_code=401)
     if status == 400:

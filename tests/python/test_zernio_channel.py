@@ -96,12 +96,45 @@ class ZernioTests(unittest.IsolatedAsyncioTestCase):
     async def test_wrong_or_missing_mapping_never_falls_back(self):
         event = self.event()
         event["account"]["id"] = "unmapped"
-        self.assertEqual((await self.receive(event))[0], 404)
+        # Signed by one of our endpoints but mapped to no bot: accepted and ignored, never a final 4xx.
+        self.assertEqual((await self.receive(event)), (202, {"ok": True, "ignored": "account_unmapped"}))
+        self.assertEqual((await self.receive(event, "not-our-secret"))[0], 401)
         self.assertEqual((await self.receive(self.event(bot=self.other)))[0], 401)
         self.bot.stop()
-        self.assertEqual((await self.receive())[0], 404)
+        with patch.object(z, "_saved_accounts", return_value=[]):
+            # No secret for this account is known any more, so the event cannot be trusted.
+            self.assertEqual((await self.receive())[0], 401)
         self.assertFalse(self.inbox)
         self.other.answer_fn.assert_not_awaited()
+
+    async def test_stopped_bot_is_retried_when_enabled_and_ignored_when_off(self):
+        self.bot.stop()
+        saved = [{"provider_id": "provider-a", "secret": "secret-a", "enabled": True}]
+        with patch.object(z, "_saved_accounts", return_value=saved):
+            status, body = await self.receive()
+            self.assertEqual(status, 503)
+            self.assertEqual(body["error"], "account_starting")
+            self.assertEqual((await self.receive(secret="wrong"))[0], 401)
+        saved[0]["enabled"] = False
+        with patch.object(z, "_saved_accounts", return_value=saved):
+            self.assertEqual((await self.receive()), (202, {"ok": True, "ignored": "account_inactive"}))
+        self.assertFalse(self.inbox)
+        # The retried event is not deduplicated away once the bot is back.
+        self.bot.start()
+        self.assertEqual((await self.receive())[0], 202)
+        self.assertEqual(len(self.inbox), 1)
+
+    async def test_renamed_shop_handle_and_bad_fields_never_return_4xx(self):
+        event = self.event()
+        event["account"]["username"] = "alice_renamed"
+        self.assertEqual((await self.receive(event))[0], 202)
+        self.assertEqual(len(self.inbox), 1)
+        broken = self.event("e9", "m9")
+        broken["message"]["sender"] = "not-a-dict"
+        self.assertEqual((await self.receive(broken)), (202, {"ok": True, "status": "invalid_sender"}))
+        late = self.event("e10", "m10")
+        late["timestamp"] = "not-a-time"
+        self.assertEqual((await self.receive(late))[0], 202)
 
     async def test_duplicate_assignment_rejected_and_stop_keeps_other_registration(self):
         with self.assertRaises(ValueError):
@@ -122,19 +155,25 @@ class ZernioTests(unittest.IsolatedAsyncioTestCase):
         event["timestamp"] = "2000-01-01T00:00:00Z"
         self.assertEqual((await self.receive(event))[1]["ignored"], "replay_or_historical")
         event["timestamp"] = "bad"
-        self.assertEqual((await self.receive(event))[0], 400)
+        self.assertEqual((await self.receive(event))[0], 202)
         event = {"id": "test", "event": "webhook.test", "timestamp": self.event()["timestamp"], "message": "test"}
         self.assertEqual((await self.receive(event))[0], 200)
         self.assertFalse(self.inbox)
 
     async def test_malformed_nested_objects(self):
-        for key in ("account", "message", "conversation", "metadata"):
-            event = self.event()
-            event[key] = ["bad"]
-            self.assertEqual((await self.receive(event))[0], 400)
+        # An unreadable account cannot be routed or verified: 400.
         event = self.event()
-        event["message"]["sender"] = ["bad"]
+        event["account"] = ["bad"]
         self.assertEqual((await self.receive(event))[0], 400)
+        # Once the signature checks out, broken fields are acknowledged and ignored, never a final 4xx.
+        for i, key in enumerate(("message", "conversation", "metadata")):
+            event = self.event(f"bad-{key}", f"bad-{key}")
+            event[key] = ["bad"]
+            self.assertEqual((await self.receive(event))[0], 202)
+        event = self.event("bad-sender", "bad-sender")
+        event["message"]["sender"] = ["bad"]
+        self.assertEqual((await self.receive(event))[0], 202)
+        self.assertFalse(self.inbox)
 
     async def test_debounce_five_seconds_since_last_message(self):
         await self.receive()

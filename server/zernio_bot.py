@@ -422,6 +422,48 @@ async def send_text_for_account(tk: dict, chat_id: str, text: str) -> Tuple[bool
     return await send_api_message(creds, chat_id, text)
 
 
+# Seconds Zernio should wait before retrying an event for a bot that is still starting.
+RETRY_AFTER_SECONDS = 30
+
+
+def _saved_accounts() -> List[dict]:
+    """Zernio accounts saved in Javis, running or not: [{provider_id, secret, enabled}]."""
+    try:
+        import channel_accounts
+        import chatbot_store
+        on = {aid for b in chatbot_store.enabled_bots() for aid in (b.get("accounts") or [])}
+        out = []
+        for a in channel_accounts.list_accounts("zernio"):
+            cr = split_credentials(channel_accounts.get_token(a["id"]))
+            if cr.get("account_id") and cr.get("secret"):
+                out.append({"provider_id": cr["account_id"], "secret": cr["secret"], "enabled": a["id"] in on})
+        return out
+    except Exception as e:  # noqa: BLE001 - a store read error must not turn into a 4xx
+        print(f"[zernio saved accounts] {type(e).__name__}: {e}", file=sys.stderr)
+        return []
+
+
+def _saved_account(provider_id: str) -> Optional[dict]:
+    matches = [a for a in _saved_accounts() if a["provider_id"] == provider_id]
+    if not matches:
+        return None
+    return {"secret": matches[0]["secret"], "enabled": any(a["enabled"] for a in matches)}
+
+
+def _known_secrets() -> List[str]:
+    found = [str(cr.get("secret") or "") for cr in _ACCOUNTS.values()]
+    found += [a["secret"] for a in _saved_accounts()]
+    return list(dict.fromkeys(s for s in found if s))
+
+
+def _note_username_change(bot, acc_obj) -> None:
+    """The account id is the identity; a renamed handle is logged, never rejected."""
+    name = str(acc_obj.get("username") or "").lstrip("@")
+    if name and name.casefold() != bot.bot_username.lstrip("@").casefold():
+        print(f"[zernio] account {bot.provider_account_id} now reports username @{name} "
+              f"(saved @{bot.bot_username.lstrip('@')})", file=sys.stderr)
+
+
 # ============================================================
 # Webhook Ingress & Verification
 # ============================================================
@@ -466,18 +508,38 @@ def _receive_webhook(raw, headers, state):
         return 400, {"ok": False, "error": "invalid_account"}
     account_id = str(acc_obj.get("accountId") or acc_obj.get("id") or "").strip()
 
+    # Zernio treats every 4xx except 408/429 as final: no retry, straight to the dead letter
+    # queue, and 20 in a row can disable the endpoint. So a correctly signed event is never
+    # answered with 4xx: it is handled, ignored with 202, or retried later with 503.
     # An account event must be signed by THAT account's configured secret.
+    bot = None
     if account_id:
         bot = _REGISTRY.get(account_id)
-        if not bot or bot._stop:
-            return 404, {"ok": False, "error": "account_unmapped"}
-        if not verify_signature(raw, sig, bot.secret):
-            return 401, {"ok": False, "error": "invalid_signature"}
+        if bot and bot._stop:
+            bot = None
+        if bot:
+            if not verify_signature(raw, sig, bot.secret):
+                return 401, {"ok": False, "error": "invalid_signature"}
+        else:
+            saved = _saved_account(account_id)
+            if saved:
+                if not verify_signature(raw, sig, saved["secret"]):
+                    return 401, {"ok": False, "error": "invalid_signature"}
+                if saved["enabled"]:
+                    # Saved and switched on but not registered: the bot is starting or restarting.
+                    return 503, {"ok": False, "error": "account_starting", "retry_after": RETRY_AFTER_SECONDS}
+                return 202, {"ok": True, "ignored": "account_inactive"}
+            if not any(verify_signature(raw, sig, s) for s in _known_secrets()):
+                return 401, {"ok": False, "error": "invalid_signature"}
+            # Signed by one of our endpoints, for a social account nobody mapped in Javis.
+            return 202, {"ok": True, "ignored": "account_unmapped"}
     elif event_name == "webhook.test":
-        if not any(verify_signature(raw, sig, cr.get("secret", "")) for cr in _ACCOUNTS.values()):
+        if not any(verify_signature(raw, sig, s) for s in _known_secrets()):
             return 401, {"ok": False, "error": "invalid_signature"}
     else:
-        return 400, {"ok": False, "error": "missing_account"}
+        if not any(verify_signature(raw, sig, s) for s in _known_secrets()):
+            return 401, {"ok": False, "error": "invalid_signature"}
+        return 202, {"ok": True, "ignored": "missing_account"}
 
     # 2. Check Deduplication
     state = _state_store.prune(state, now)
@@ -489,7 +551,7 @@ def _receive_webhook(raw, headers, state):
         import datetime
         occurred_at = datetime.datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
     except Exception:
-        return 400, {"ok": False, "error": "invalid_timestamp"}
+        return 202, {"ok": True, "ignored": "invalid_timestamp"}
 
     if occurred_at > now + 300 or (now - occurred_at) > MAX_AGE_SECONDS:
         return 202, {"ok": True, "ignored": "replay_or_historical"}
@@ -506,10 +568,9 @@ def _receive_webhook(raw, headers, state):
     if event_name == "message.sent":
         msg = body.get("message") or {}
         if not isinstance(msg, dict):
-            return 400, {"ok": False, "error": "invalid_message"}
+            return mark_event_handled(202, "invalid_message")
         platform = str(acc_obj.get("platform") or msg.get("platform") or "").lower()
-        if acc_obj.get("username") and str(acc_obj["username"]).lstrip("@").casefold() != bot.bot_username.lstrip("@").casefold():
-            return 400, {"ok": False, "error": "account_username_mismatch"}
+        _note_username_change(bot, acc_obj)
         if platform != "instagram":
             return mark_event_handled(202, "unsupported_platform")
         return _receive_sent(state, bot, body, msg, account_id, now, mark_event_handled)
@@ -521,10 +582,9 @@ def _receive_webhook(raw, headers, state):
     # 6. Message Eligibility Checks
     msg = body.get("message") or {}
     if not isinstance(msg, dict):
-        return 400, {"ok": False, "error": "invalid_message"}
+        return mark_event_handled(202, "invalid_message")
     platform = str(acc_obj.get("platform") or msg.get("platform") or "").lower()
-    if acc_obj.get("username") and str(acc_obj["username"]).lstrip("@").casefold() != bot.bot_username.lstrip("@").casefold():
-        return 400, {"ok": False, "error": "account_username_mismatch"}
+    _note_username_change(bot, acc_obj)
     if platform != "instagram":
         return mark_event_handled(202, "unsupported_platform")
 
@@ -534,7 +594,7 @@ def _receive_webhook(raw, headers, state):
 
     meta_obj = body.get("metadata") or {}
     if not isinstance(meta_obj, dict):
-        return 400, {"ok": False, "error": "invalid_metadata"}
+        return mark_event_handled(202, "invalid_metadata")
     if meta_obj.get("standby") or meta_obj.get("historical") or msg.get("historical") or msg.get("isHistorical"):
         return mark_event_handled(202, "standby_or_historical")
 
@@ -542,12 +602,12 @@ def _receive_webhook(raw, headers, state):
     platform_msg_id = str(msg.get("platformMessageId") or msg.get("id") or "").strip()
     sender = msg.get("sender") or {}
     if not isinstance(sender, dict):
-        return 400, {"ok": False, "error": "invalid_sender"}
+        return mark_event_handled(202, "invalid_sender")
     sender_id = str(sender.get("id") or "").strip()
     sender_username = str(sender.get("username") or "").strip()
 
     if not msg_id or not platform_msg_id or not sender_id:
-        return mark_event_handled(400, "invalid_message")
+        return mark_event_handled(202, "invalid_message")
 
     # Check bot sender
     acc_username = bot.bot_username.lstrip("@").casefold()
@@ -556,10 +616,10 @@ def _receive_webhook(raw, headers, state):
 
     conv_obj = body.get("conversation") or {}
     if not isinstance(conv_obj, dict):
-        return 400, {"ok": False, "error": "invalid_conversation"}
+        return mark_event_handled(202, "invalid_conversation")
     conv_id = str(conv_obj.get("id") or msg.get("conversationId") or "").strip()
     if not conv_id:
-        return mark_event_handled(400, "missing_conversation_id")
+        return mark_event_handled(202, "missing_conversation_id")
 
     # Message-level deduplication
     msg_key = _batch_key(account_id, platform_msg_id)
@@ -671,7 +731,7 @@ def _receive_sent(state, bot, body, msg, account_id, now, mark_event_handled):
     conv_obj = body.get("conversation") if isinstance(body.get("conversation"), dict) else {}
     conv_id = str(conv_obj.get("id") or msg.get("conversationId") or "").strip()
     if not platform_msg_id or not conv_id:
-        return mark_event_handled(400, "invalid_message")
+        return mark_event_handled(202, "invalid_message")
     out_key = _batch_key(account_id, "out:" + platform_msg_id)
     if out_key in state["messages"]:
         return mark_event_handled(200, "duplicate_message")
@@ -1150,7 +1210,7 @@ async def handle_inbound(payload: dict, auth_header: str) -> Tuple[int, dict]:
         return 400, {"ok": False, "error": "invalid_messages"}
     for message in messages:
         if not isinstance(message, dict) or not message.get("id") or not isinstance(message.get("sender"), dict) or not message["sender"].get("id"):
-            return 400, {"ok": False, "error": "invalid_message"}
+            return mark_event_handled(202, "invalid_message")
         if str(message["sender"].get("id")) == provider_id or str(message["sender"].get("username") or "").lstrip("@").casefold() == bot.bot_username.lstrip("@").casefold():
             return 400, {"ok": False, "error": "self_message"}
         if message.get("direction", "incoming") != "incoming" or message.get("isEcho") or message.get("is_echo") or message.get("historical"):
