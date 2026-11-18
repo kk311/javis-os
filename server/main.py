@@ -29125,7 +29125,7 @@ async def channels_webhook_info(request: Request, channel: str = "", connection_
             return JSONResponse({"ok": False, "error": exc.code}, status_code=502)
         return {"ok": True, "webhook_url": url, "verify_token": "", "https": url.startswith("https://"),
                 "accounts": accounts, "signature_header": "X-Zernio-Signature",
-                "signature_algorithm": "HMAC-SHA256", "events": ["message.received"],
+                "signature_algorithm": "HMAC-SHA256", "events": ["message.received", "message.sent"],
                 "credentials_format": "json", "account_id_kind": "zernio_provider"}
     if kenh != "messenger":
         return JSONResponse({"ok": False, "error": localefmt.chu("Kênh này không dùng webhook",
@@ -29229,7 +29229,7 @@ async def zernio_accounts_with_key(api_key: str = Form(...)):
 
 @app.get("/channels/zernio/connected-accounts")
 async def zernio_connected_accounts(connection_id: str = ""):
-    """Lists connected Instagram accounts from Zernio connection."""
+    """Lists the social accounts of a Zernio connection, every platform."""
     import zernio_bot
     try:
         accounts = await asyncio.to_thread(zernio_bot.connected_accounts, connection_id)

@@ -29,7 +29,7 @@ async function testForm(dictionary) {
     fd: data => data, api: async (url, options) => {
       calls.push({url, options});
       if (url.endsWith('/connections')) return {connections:[{id:'conn-a',label:'First'},{id:'conn-b',label:'Second'}]};
-      if (url.includes('webhook-info')) return {webhook_url:'https://example.com/webhooks/zernio', events:['message.received'],signature_header:'X-Zernio-Signature',signature_algorithm:'HMAC-SHA256',https:true};
+      if (url.includes('webhook-info')) return {webhook_url:'https://example.com/webhooks/zernio', events:['message.received','message.sent'],signature_header:'X-Zernio-Signature',signature_algorithm:'HMAC-SHA256',https:true};
       if (failAccounts) throw new Error('provider_unavailable');
       if (url.includes('conn-a')) return new Promise(resolve => { resolveSlow = resolve; });
       return {accounts:[{id:'provider-b',username:'alice',platform:'instagram'}]};

@@ -625,14 +625,25 @@ class ZernioTests(unittest.IsolatedAsyncioTestCase):
     def test_bot_echo_is_matched_by_id_once_known(self):
         text = "Dạ shop chưa hiểu ạ, mình mô tả thêm giúp shop nha."
         now = 1000.0
-        # Reply accepted with an id: staff typing the very same words is not taken for the bot.
-        cur = {"bot_sent": [{"t": z._norm_text(text), "ts": now, "id": "m-1"}]}
-        self.assertFalse(z._is_bot_echo(cur, {"id": "m-2", "text": text}, now + 5))
-        self.assertTrue(z._is_bot_echo(cur, {"id": "m-1", "platformMessageId": "x", "text": "whatever"}, now + 6))
+        entry = lambda: {"bot_sent": [{"t": z._norm_text(text), "ts": now, "id": "m-1"}]}
+        # Staff in the Instagram app or the Zernio dashboard typing the bot's exact template is staff.
+        for via in ("human", "broadcast"):
+            cur = entry()
+            self.assertFalse(z._is_bot_echo(cur, {"id": "m-2", "text": text, "sentVia": via}, now + 5))
+            self.assertEqual(len(cur["bot_sent"]), 1)
+        # Matched by the id Zernio returned, whatever the text.
+        cur = entry()
+        self.assertTrue(z._is_bot_echo(cur, {"id": "x", "platformMessageId": "m-1", "text": "khác", "sentVia": "api"}, now + 6))
         self.assertEqual(cur["bot_sent"], [])
-        # Id not known yet (reply in flight, or no id in the response): fall back to the words.
-        cur = {"bot_sent": [{"t": z._norm_text(text), "ts": now}]}
-        self.assertTrue(z._is_bot_echo(cur, {"id": "m-3", "text": text}, now + 1))
+        # Ids that do not line up never turn the bot's own reply into staff: the words still match.
+        cur = entry()
+        self.assertTrue(z._is_bot_echo(cur, {"id": "other", "text": text, "sentVia": "api"}, now + 7))
+        cur = entry()
+        self.assertTrue(z._is_bot_echo(cur, {"id": "other", "text": text}, now + 7))
+        # One part of a long reply split by the platform.
+        long = "Dạ son này còn hàng ạ, giá 250k, có ba màu đỏ cam hồng. " * 3
+        cur = {"bot_sent": [{"t": z._norm_text(long), "ts": now, "id": "m-9"}]}
+        self.assertTrue(z._is_bot_echo(cur, {"id": "p-2", "text": "có ba màu đỏ cam hồng", "sentVia": "api"}, now + 2))
 
     def test_send_response_message_id(self):
         ok = MagicMock(); ok.json.return_value = {"success": True, "data": {"messageId": "abc", "conversationId": "c"}}

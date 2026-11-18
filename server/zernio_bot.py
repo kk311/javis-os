@@ -832,11 +832,16 @@ def _conversation_state(state, bot, conversation_id):
 def _is_bot_echo(current, msg, now) -> bool:
     """True (and forgets the entry) when an outgoing message is one of the bot's own replies.
 
-    A reply whose id Zernio gave back is matched by that id only, so staff typing the same words is
-    still staff. Text is the fallback for a reply still in flight or whose response carried no id.
+    The bot sends through the API, so a message Zernio marks as sent another way (`sentVia` human,
+    broadcast...) is never the bot, even with the bot's exact words. The id Zernio returned for the
+    send is matched first; the words are the fallback because Zernio does not document that the
+    `message.sent` ids equal that returned id.
     """
     sent = [e for e in current.get("bot_sent", []) if now - float(e.get("ts") or 0) < BOT_ECHO_WINDOW]
     current["bot_sent"] = sent
+    via = str(msg.get("sentVia") or "").strip().lower()
+    if via and via != "api":
+        return False
     ids = {str(msg.get("id") or "").strip(), str(msg.get("platformMessageId") or "").strip()} - {""}
     for i, entry in enumerate(sent):
         if entry.get("id") and entry["id"] in ids:
@@ -846,10 +851,8 @@ def _is_bot_echo(current, msg, now) -> bool:
     if not echo:
         return False
     for i, entry in enumerate(sent):
-        if entry.get("id"):
-            continue
         mine = entry.get("t") or ""
-        # Equal, or one part of a long reply Instagram split in several messages.
+        # Equal, or one part of a long reply the platform split in several messages.
         if echo == mine or (len(echo) >= 20 and echo in mine):
             if echo == mine:
                 sent.pop(i)
@@ -1287,7 +1290,7 @@ async def _flush_locked(key):
                     # Remember the text before HTTP so its `message.sent` echo is not taken for staff.
                     current["bot_sent"] = [e for e in current.get("bot_sent", [])
                                            if _now() - float(e.get("ts") or 0) < BOT_ECHO_WINDOW][-19:]
-                    if not any(e.get("t") == _norm_text(reply) and not e.get("id") for e in current["bot_sent"]):
+                    if not any(e.get("t") == _norm_text(reply) for e in current["bot_sent"]):
                         current["bot_sent"].append({"t": _norm_text(reply), "ts": _now()})
                     # Persist a retry guard before HTTP too, including crash during send.
                     current["next_retry_at"] = min(
