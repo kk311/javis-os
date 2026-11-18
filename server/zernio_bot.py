@@ -1021,6 +1021,15 @@ async def _flush_locked(key):
                     "message_id": batch[-1].get("platformMessageId") or batch[-1]["id"],
                     "_defer_zernio_delivery": True}
             result = await bot.answer_fn(text, meta, None) if text else ""
+            if isinstance(result, dict) and result.get("bao_chu"):
+                # The bot cannot decide this one ([BAO_CHU]): nothing goes to the customer, staff takes over.
+                with _state_store.transaction() as state:
+                    current = state["conversations"].get(key)
+                    if not owns_batch(current):
+                        return
+                    _handoff(current)
+                _complete_handoff(key, bot)
+                return
             reply = "" if isinstance(result, dict) and result.get("im_lang") else str(
                 result.get("text") or "") if isinstance(result, dict) else str(result or "")
             with _state_store.transaction() as state:

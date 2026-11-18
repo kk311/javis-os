@@ -451,6 +451,28 @@ class ZernioTests(unittest.IsolatedAsyncioTestCase):
         self.bot.answer_fn.assert_not_awaited()
         self.bot.send_delivery.assert_not_awaited()
 
+    async def test_bao_chu_hands_off_silently(self):
+        self.use_real_modes()
+        self.bot.answer_fn = AsyncMock(return_value={"text": "", "im_lang": True, "bao_chu": True})
+        await self.receive()
+        self.clock += 5
+        await self.flush()
+        self.bot.answer_fn.assert_awaited_once()
+        self.bot.send_delivery.assert_not_awaited()
+        self.assert_auto_handoff(self.delivery_state())
+
+    async def test_im_lang_stays_silent_without_handoff(self):
+        self.use_real_modes()
+        self.bot.answer_fn = AsyncMock(return_value={"text": "", "im_lang": True})
+        await self.receive()
+        self.clock += 5
+        await self.flush()
+        self.bot.send_delivery.assert_not_awaited()
+        current = self.delivery_state()
+        self.assertNotIn("auto_handoff", current)
+        self.assertNotIn("processing", current)
+        self.assertEqual(conversations.che_do("zernio", "acc_a", "same-conversation"), "ai")
+
     def mock_provider(self, status=503, retry_after=None, error=None):
         from types import SimpleNamespace
         client = AsyncMock()
