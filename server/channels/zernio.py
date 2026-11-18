@@ -1,7 +1,7 @@
 """Zernio channel (multi-channel social messaging via Zernio): a dedicated bot
 answers through `zernio_bot.ZernioBot`, fed by the `/webhooks/zernio` route.
 
-Currently supports Instagram messaging, with 5-second message debounce batching,
+Supports every Zernio inbox platform, with 5-second message debounce batching,
 constant-time HMAC-SHA256 signature verification, and deduplication.
 """
 from __future__ import annotations
@@ -16,22 +16,22 @@ SPEC = KenhSpec(
     logo="zernio",
     mau="#6366F1",
     lay_token=(
-        "Nối tài khoản mạng xã hội qua Zernio (hỗ trợ Instagram). "
+        "Nối tài khoản mạng xã hội qua Zernio (Instagram, Facebook, X, Telegram...). "
         "Dán Account ID, Username và Webhook Secret (hoặc chọn từ tài khoản Zernio đã kết nối)."
     ),
     tom_tat=(
-        "Nhắn tin đa kênh qua Zernio (hỗ trợ Instagram). "
+        "Nhắn tin đa kênh qua Zernio (Instagram, Facebook, X, Telegram...). "
         "Tự động gom tin 5 giây, bảo vệ chống trùng, xác thực HMAC webhook."
     ),
     nang_luc={"nhom": False, "gui_chu": True, "gui_file": False, "tra_loi_tu_javis": True, "bot": True},
     en={
         "nhan": "Zernio",
         "lay_token": (
-            "Connect social channels via Zernio (Instagram supported). "
+            "Connect social channels via Zernio (Instagram, Facebook, X, Telegram...). "
             "Paste Account ID, Username and Webhook Secret (or choose from connected Zernio accounts)."
         ),
         "tom_tat": (
-            "Multi-channel messaging via Zernio (Instagram supported). "
+            "Multi-channel messaging via Zernio (Instagram, Facebook, X, Telegram...). "
             "Automatic 5s message batching, deduplication, and HMAC webhook authentication."
         ),
     },
@@ -74,14 +74,15 @@ async def verify_token(token: str) -> dict:
     if not info.get("ok"):
         return {"ok": False, "code": info.get("error", "invalid_credentials"), "error": info.get("error", "")}
 
+    platform = str(info["account"].get("platform") or "")
     return {
         "ok": True,
         "username": info["account"]["username"],
-        "bot_name": f"@{cr['username']} (Instagram)",
-        "account_type": "instagram",
+        "bot_name": f"@{cr['username']} ({platform.capitalize() or 'Zernio'})",
+        "account_type": platform or "zernio",
         "vao_duoc_nhom": False,
         "meta": {
-            "platform": "instagram",
+            "platform": platform,
             "account_id": cr["account_id"],
             "username": info["account"]["username"],
             "credentials_verified": True,

@@ -29120,7 +29120,7 @@ async def channels_webhook_info(request: Request, channel: str = "", connection_
             request.headers.get("x-forwarded-proto", ""), request.headers.get("x-forwarded-host", ""))
         url = base + "/webhooks/zernio"
         try:
-            accounts = [] if config_only else await asyncio.to_thread(zernio_bot.connected_instagram_accounts, connection_id)
+            accounts = [] if config_only else await asyncio.to_thread(zernio_bot.connected_accounts, connection_id)
         except zernio_bot.CredentialsError as exc:
             return JSONResponse({"ok": False, "error": exc.code}, status_code=502)
         return {"ok": True, "webhook_url": url, "verify_token": "", "https": url.startswith("https://"),
@@ -29221,7 +29221,7 @@ async def zernio_accounts_with_key(api_key: str = Form(...)):
     if not api_key.strip():
         return JSONResponse({"ok": False, "error": "missing_api_key"}, status_code=400)
     try:
-        accounts = await asyncio.to_thread(zernio_bot.connected_instagram_accounts, "", api_key)
+        accounts = await asyncio.to_thread(zernio_bot.connected_accounts, "", api_key)
     except zernio_bot.CredentialsError as exc:
         return JSONResponse({"ok": False, "error": exc.code}, status_code=502)
     return {"ok": True, "accounts": accounts}
@@ -29232,7 +29232,7 @@ async def zernio_connected_accounts(connection_id: str = ""):
     """Lists connected Instagram accounts from Zernio connection."""
     import zernio_bot
     try:
-        accounts = await asyncio.to_thread(zernio_bot.connected_instagram_accounts, connection_id)
+        accounts = await asyncio.to_thread(zernio_bot.connected_accounts, connection_id)
     except zernio_bot.CredentialsError as exc:
         return JSONResponse({"ok": False, "error": exc.code}, status_code=502)
     return {"ok": True, "accounts": accounts}

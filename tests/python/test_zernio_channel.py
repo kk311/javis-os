@@ -964,7 +964,7 @@ sys.stdin.read()
             self.assertEqual(client.get("/channels/webhook-info?channel=zernio").status_code, 401)
             self.assertEqual(client.get("/channels/zernio/connected-accounts").status_code, 401)
         with patch.object(main.cfgmod, "gate_active", return_value=False), \
-             patch.object(z, "connected_instagram_accounts", return_value=[{"id": "provider-a", "username": "alice", "platform": "instagram"}]):
+             patch.object(z, "connected_accounts", return_value=[{"id": "provider-a", "username": "alice", "platform": "instagram"}]):
             response = client.get("/channels/webhook-info?channel=zernio")
             self.assertEqual(response.status_code, 200, response.text)
             body = response.json()
@@ -975,7 +975,7 @@ sys.stdin.read()
             self.assertNotIn("private-key", response.text)
             self.assertNotIn("secret-a", response.text)
         with patch.object(main.cfgmod, "gate_active", return_value=False), \
-             patch.object(z, "connected_instagram_accounts", side_effect=z.CredentialsError("provider_unavailable")):
+             patch.object(z, "connected_accounts", side_effect=z.CredentialsError("provider_unavailable")):
             response = client.get("/channels/webhook-info?channel=zernio")
             self.assertEqual(response.status_code, 502)
             self.assertEqual(response.json()["error"], "provider_unavailable")

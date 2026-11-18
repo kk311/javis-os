@@ -1,4 +1,4 @@
-"""Zernio messaging gateway for Javis OS (Instagram and multi-channel inbox).
+"""Zernio messaging gateway for Javis OS (any messaging platform Zernio supports).
 
 Key features:
 1. Webhook ingress: verifies constant-time HMAC-SHA256 signature using `X-Zernio-Signature`
@@ -151,7 +151,7 @@ def _rest_accounts(key: str) -> List[dict]:
     import urllib.error
     out, cursor, seen = [], "", set()
     while True:
-        params = {"platform": "instagram", "limit": 100}
+        params = {"limit": 100}
         if cursor:
             params["cursor"] = cursor
         req = urllib.request.Request(API_BASE + "/accounts?" + urlencode(params), headers={
@@ -166,12 +166,12 @@ def _rest_accounts(key: str) -> List[dict]:
         if not isinstance(data, dict) or not isinstance(data.get("accounts"), list):
             raise CredentialsError("invalid_provider_response")
         for account in data["accounts"]:
-            if not isinstance(account, dict) or account.get("platform") != "instagram":
+            if not isinstance(account, dict):
                 continue
             aid = str(account.get("_id") or account.get("id") or account.get("accountId") or "")
             username = str(account.get("username") or "").lstrip("@")
             if aid and username:
-                out.append({"id": aid, "username": username, "platform": "instagram"})
+                out.append({"id": aid, "username": username, "platform": str(account.get("platform") or "").lower()})
         cursor = (data.get("pagination") or {}).get("nextCursor")
         if not cursor:
             return out
@@ -180,7 +180,7 @@ def _rest_accounts(key: str) -> List[dict]:
         seen.add(cursor)
 
 
-def connected_instagram_accounts(connection_id: str = "", api_key: str = "") -> List[dict]:
+def connected_accounts(connection_id: str = "", api_key: str = "") -> List[dict]:
     return _rest_accounts(api_key or connection_api_key(connection_id))
 
 
@@ -652,10 +652,7 @@ def _receive_webhook(raw, headers, state):
         msg = body.get("message") or {}
         if not isinstance(msg, dict):
             return mark_event_handled(202, "invalid_message")
-        platform = str(acc_obj.get("platform") or msg.get("platform") or "").lower()
         _note_username_change(bot, acc_obj)
-        if platform != "instagram":
-            return mark_event_handled(202, "unsupported_platform")
         return _receive_sent(state, bot, body, msg, account_id, now, mark_event_handled)
 
     # 6. Handle other non-message events
@@ -668,9 +665,6 @@ def _receive_webhook(raw, headers, state):
         return mark_event_handled(202, "invalid_message")
     platform = str(acc_obj.get("platform") or msg.get("platform") or "").lower()
     _note_username_change(bot, acc_obj)
-    if platform != "instagram":
-        return mark_event_handled(202, "unsupported_platform")
-
     direction = str(msg.get("direction") or "").lower()
     if direction != "incoming" or msg.get("is_echo") or msg.get("isEcho"):
         return mark_event_handled(202, "echo")
@@ -710,6 +704,8 @@ def _receive_webhook(raw, headers, state):
         return mark_event_handled(200, "duplicate_message")
 
     _enqueue(state, bot, conv_id, [msg], now)
+    if platform:
+        _conversation_state(state, bot, conv_id)[1]["platform"] = platform
     state["events"][event_id] = {"ts": now, "iso": ts_str}
     return 202, {"ok": True, "status": "queued"}
 
@@ -1059,6 +1055,10 @@ _FAIL_REASONS = {
 }
 
 
+def _platform_label(current) -> str:
+    return str(current.get("platform") or "").capitalize() or "Zernio"
+
+
 def _ring_failure(bot, current, reason):
     """One bell note per failed reply; `dedup` keeps a retried flush from ringing twice."""
     import inbox
@@ -1066,7 +1066,7 @@ def _ring_failure(bot, current, reason):
     sender = (batch[-1].get("sender") or {}) if batch else {}
     name = str(sender.get("name") or sender.get("username") or current.get("conversation_id") or "")
     why = _FAIL_REASONS.get(reason, "lỗi gửi")
-    inbox.add(f"Bot không gửi được câu trả lời cho khách {name} trên Instagram ({why}). "
+    inbox.add(f"Bot không gửi được câu trả lời cho khách {name} trên kênh {_platform_label(current)} ({why}). "
               "Nhân viên kiểm tra hội thoại giúp.",
               kind="system", channel="zernio", title="Zernio: chưa gửi được tin cho khách",
               dedup="zernio-fail:" + str(current.get("send_key") or ""))
@@ -1284,8 +1284,6 @@ async def handle_inbound(payload: dict, auth_header: str) -> Tuple[int, dict]:
     bot = _REGISTRY.get(provider_id)
     if not bot or bot._stop:
         return 404, {"ok": False, "error": "account_unmapped"}
-    if account.get("platform", "instagram") != "instagram":
-        return 400, {"ok": False, "error": "unsupported_platform"}
     if payload.get("bot_id") or payload.get("botId"):
         return 400, {"ok": False, "error": "client_routing_forbidden"}
     conversation_id = payload.get("conversationId")

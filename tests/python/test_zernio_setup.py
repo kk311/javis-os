@@ -52,7 +52,7 @@ class ZernioSetupTests(unittest.TestCase):
             self.assertEqual(z.connection_api_key(cid), "")
         self.assertEqual(z.connection_api_key("connection-b"), "private-connection-b")
         self.assertEqual(z.available_connections(), [{"id": "connection-a", "label": "Team A"}, {"id": "connection-b", "label": "Team B"}])
-        self.assertEqual(z.connected_instagram_accounts("connection-b")[0]["id"], "provider-private-connection-b")
+        self.assertEqual(z.connected_accounts("connection-b")[0]["id"], "provider-private-connection-b")
 
     def test_invalid_explicit_connection_never_falls_back_to_unique_default(self):
         self.connections[:] = self.connections[:1]
