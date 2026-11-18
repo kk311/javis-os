@@ -939,18 +939,35 @@ def _handoff(current):
     current["auto_handoff"] = True
 
 
-def _block_delivery(current, reason):
-    """Commit handoff intent and evidence before touching the inbox database."""
-    current["delivery_batch"] = {field: current.pop(field) for field in
-        ("processing", "reply", "reply_created_at", "send_key", "attempts", "next_retry_at") if field in current}
-    batch = current["delivery_batch"]
-    previous = current.get("delivery_issue") or {}
-    current["delivery_issue"] = {
-        "id": batch["send_key"], "revision": previous.get("revision", 0) + 1, "reason": reason,
-        "created_at": previous.get("created_at", _now()),
-        "attempts": batch.get("attempts", 0), "next_retry_at": None}
-    current["handoff_pending"] = True
-    current.pop("blocked_reason", None)
+_FAIL_REASONS = {
+    "provider_http_401": "Zernio từ chối quyền",
+    "provider_http_403": "Zernio từ chối quyền",
+    "provider_http_429": "Zernio giới hạn tốc độ",
+    "idempotency_window_expired": "quá 23 giờ chưa gửi được",
+}
+
+
+def _ring_failure(bot, current, reason):
+    """One bell note per failed reply; `dedup` keeps a retried flush from ringing twice."""
+    import inbox
+    batch = current.get("processing") or []
+    sender = (batch[-1].get("sender") or {}) if batch else {}
+    name = str(sender.get("name") or sender.get("username") or current.get("conversation_id") or "")
+    why = _FAIL_REASONS.get(reason, "lỗi gửi")
+    inbox.add(f"Bot không gửi được câu trả lời cho khách {name} trên Instagram ({why}). "
+              "Nhân viên kiểm tra hội thoại giúp.",
+              kind="system", channel="zernio", title="Zernio: chưa gửi được tin cho khách",
+              dedup="zernio-fail:" + str(current.get("send_key") or ""))
+
+
+def _delivery_failed(current, bot, reason):
+    """Give up on this reply: ring the bell, drop the batch. The mode does not change.
+
+    Runs inside the journal transaction; a bell failure aborts it so the batch is retried.
+    """
+    _ring_failure(bot, current, reason)
+    for field in _BATCH_FIELDS + ("delivery_issue", "delivery_batch", "blocked_reason"):
+        current.pop(field, None)
 
 
 def _resume_ai(bot, conversation_id):
@@ -1070,7 +1087,8 @@ async def _flush_locked(key):
                     return
                 expired = _now() >= current.get("reply_created_at", 0) + 23 * 3600
                 if expired:
-                    _block_delivery(current, "idempotency_window_expired")
+                    _delivery_failed(current, bot, "idempotency_window_expired")
+                    pending = bool(current.get("messages"))
                 else:
                     delay = current.get("next_retry_at", 0) - _now()
                     if delay > 0:
@@ -1088,7 +1106,8 @@ async def _flush_locked(key):
                         _now() + retry_delay(attempt, None, random.random()),
                         current["reply_created_at"] + 23 * 3600)
             if expired:
-                _complete_handoff(key, bot)
+                if pending:
+                    _arm_timer(key, max(0, current.get("due_at", _now()) - _now()))
                 return
             result = await bot.send_delivery(conversation_id, reply.strip(), send_key)
             if result["kind"] != "accepted":
@@ -1100,16 +1119,13 @@ async def _flush_locked(key):
                     reason = result["code"] if result["kind"] == "blocked" else (
                         "idempotency_window_expired" if next_retry >= current["reply_created_at"] + 23 * 3600 else "")
                     if reason:
-                        _block_delivery(current, reason)
+                        _delivery_failed(current, bot, reason)
+                        pending = bool(current.get("messages"))
                     else:
                         current["next_retry_at"] = next_retry
-                        previous = current.get("delivery_issue") or {}
-                        current["delivery_issue"] = {
-                            "id": send_key, "revision": previous.get("revision", 0) + 1,
-                            "reason": result["code"], "created_at": previous.get("created_at", _now()),
-                            "attempts": current["attempts"], "next_retry_at": next_retry}
                 if reason:
-                    _complete_handoff(key, bot)
+                    if pending:
+                        _arm_timer(key, max(0, current.get("due_at", _now()) - _now()))
                 else:
                     _arm_timer(key, next_retry - _now())
                 return

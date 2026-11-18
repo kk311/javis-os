@@ -10,7 +10,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.error import HTTPError
 
 _test_root = tempfile.TemporaryDirectory(prefix="zernio-test-")
@@ -600,44 +600,85 @@ class ZernioTests(unittest.IsolatedAsyncioTestCase):
         del self.bot.send_delivery
         return client
 
-    async def test_expired_batch_handoffs_without_head_of_line_retry(self):
+    def bell(self):
+        import inbox
+        rings = MagicMock(return_value={"id": "x"})
+        p = patch.object(inbox, "add", rings)
+        p.start()
+        self.addCleanup(p.stop)
+        return rings
+
+    async def test_expired_delivery_rings_bell_and_accepts_new_messages(self):
         client = self.mock_provider()
-        self.mode_patch.stop()
-        cid = conversations.conversation_id_of("zernio", "acc_a", "same-conversation")
-        if cid:
-            conversations.dat_che_do(cid, "ai")
+        rings = self.bell()
+        self.use_real_modes()
         await self.receive()
         self.clock += 5
         await self.flush()
         self.clock += 23 * 3600
         await self.flush()
         current = self.delivery_state()
-        self.assertNotIn("processing", current)
-        self.assertEqual(current["delivery_issue"]["reason"], "idempotency_window_expired")
-        self.assertEqual(current["delivery_batch"]["processing"][0]["id"], "m1")
-        self.assertTrue(current["delivery_batch"]["send_key"])
-        self.assertEqual(conversations.che_do("zernio", "acc_a", "same-conversation"), "human")
+        for field in ("processing", "send_key", "delivery_issue", "delivery_batch", "handoff_pending", "auto_handoff"):
+            self.assertNotIn(field, current)
+        self.assertEqual(rings.call_count, 1)
+        self.assertIn("quá 23 giờ", rings.call_args.args[0])
+        self.assertTrue(rings.call_args.kwargs["dedup"].startswith("zernio-fail:zernio-"))
+        self.assertEqual(self.mode_now(), "ai")
+        client.post.return_value.status_code = 200
         await self.receive(self.event("e2", "m2"))
         self.restart_delivery()
         self.clock += 5
         await self.flush()
         self.assertTrue(conversations.tin_theo_id("zernio", "acc_a", "same-conversation", "m2"))
         self.assertNotIn("processing", self.delivery_state())
-        self.assertEqual(client.post.await_count, 1)
+        self.assertEqual(self.bot.answer_fn.await_count, 2)
+        self.assertEqual(rings.call_count, 1)
 
-    async def test_auth_error_blocks_once(self):
-        client = self.mock_provider(401)
+    async def test_rejected_delivery_rings_bell_once(self):
+        client = self.mock_provider(403)
+        rings = self.bell()
+        self.use_real_modes()
         await self.receive()
         self.clock += 5
         await self.flush()
-        self.assertEqual(self.delivery_state().get("delivery_issue", {}).get("reason"), "provider_http_401")
+        current = self.delivery_state()
+        for field in ("processing", "send_key", "delivery_issue", "delivery_batch", "handoff_pending", "auto_handoff"):
+            self.assertNotIn(field, current)
+        self.assertEqual(rings.call_count, 1)
+        self.assertIn("Zernio từ chối quyền", rings.call_args.args[0])
+        self.assertEqual(rings.call_args.kwargs["kind"], "system")
+        self.assertEqual(rings.call_args.kwargs["channel"], "zernio")
+        self.assertEqual(self.mode_now(), "ai")
         key = z._batch_key("provider-a", "same-conversation")
         self.assertNotIn(key, z._TIMERS)
         self.restart_delivery()
         self.clock += 100
         await self.flush()
         self.assertEqual(client.post.await_count, 1)
-        self.assertNotIn(key, z._TIMERS)
+        self.assertEqual(rings.call_count, 1)
+
+    async def test_endless_retry_after_gives_up_with_bell(self):
+        self.mock_provider(429, "999999")
+        rings = self.bell()
+        await self.receive()
+        self.clock += 5
+        await self.flush()
+        self.assertEqual(rings.call_count, 1)
+        self.assertIn("quá 23 giờ", rings.call_args.args[0])
+
+    async def test_bell_failure_keeps_batch_for_retry(self):
+        self.mock_provider(403)
+        import inbox
+        with patch.object(inbox, "add", side_effect=OSError("disk full")):
+            await self.receive()
+            self.clock += 5
+            await self.flush()
+        self.assertTrue(self.delivery_state().get("processing"))
+        rings = self.bell()
+        self.clock += 3600
+        await self.flush()
+        self.assertEqual(rings.call_count, 1)
+        self.assertNotIn("processing", self.delivery_state())
 
     async def test_restart_preserves_reply_and_send_key(self):
         client = self.mock_provider(error=TimeoutError())
@@ -646,9 +687,7 @@ class ZernioTests(unittest.IsolatedAsyncioTestCase):
         await self.flush()
         current = self.delivery_state()
         self.assertEqual(current.get("attempts"), 1)
-        self.assertEqual(current.get("delivery_issue", {}).get("reason"), "provider_unavailable")
-        self.assertEqual(current["delivery_issue"]["attempts"], 1)
-        self.assertEqual(current["delivery_issue"]["next_retry_at"], current["next_retry_at"])
+        self.assertNotIn("delivery_issue", current)
         retry_at = current["next_retry_at"]
         self.assertGreaterEqual(retry_at, self.clock + 5)
         self.restart_delivery()
@@ -666,6 +705,7 @@ class ZernioTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_retry_after_survives_restart_and_deadline(self):
         client = self.mock_provider(429, "120")
+        rings = self.bell()
         await self.receive()
         self.clock += 5
         await self.flush()
@@ -678,24 +718,8 @@ class ZernioTests(unittest.IsolatedAsyncioTestCase):
         client.post.return_value.headers = {"Retry-After": "999999"}
         await self.flush()
         self.assertNotIn("processing", self.delivery_state())
-        self.assertEqual(self.delivery_state()["delivery_issue"]["reason"], "idempotency_window_expired")
-
-    async def test_restart_completes_handoff_between_databases(self):
-        self.mock_provider(403)
-        await self.receive()
-        self.clock += 5
-        with patch.object(conversations, "dat_che_do", side_effect=RuntimeError("simulated crash")):
-            await self.flush()
-        current = self.delivery_state()
-        self.assertIn("delivery_issue", current)
-        self.assertTrue(current["handoff_pending"])
-        issue_id = current["delivery_issue"]["id"]
-        self.restart_delivery()
-        await self.flush()
-        self.assertFalse(self.delivery_state()["handoff_pending"])
-        self.assertEqual(self.delivery_state()["delivery_issue"]["id"], issue_id)
-        cid = conversations.conversation_id_of("zernio", "acc_a", "same-conversation")
-        self.assertEqual(conversations.chi_tiet(cid)["mode"], "human")
+        self.assertNotIn("delivery_issue", self.delivery_state())
+        self.assertEqual(rings.call_count, 1)
 
     async def test_inflight_reassignment_cannot_write_reply_into_new_batch(self):
         entered, release = asyncio.Event(), asyncio.Event()
