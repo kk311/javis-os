@@ -1375,7 +1375,7 @@ async def handle_inbound(payload: dict, auth_header: str) -> Tuple[int, dict]:
         return 400, {"ok": False, "error": "invalid_messages"}
     for message in messages:
         if not isinstance(message, dict) or not message.get("id") or not isinstance(message.get("sender"), dict) or not message["sender"].get("id"):
-            return mark_event_handled(202, "invalid_message")
+            return 400, {"ok": False, "error": "invalid_message"}
         if str(message["sender"].get("id")) == provider_id or str(message["sender"].get("username") or "").lstrip("@").casefold() == bot.bot_username.lstrip("@").casefold():
             return 400, {"ok": False, "error": "self_message"}
         if message.get("direction", "incoming") != "incoming" or message.get("isEcho") or message.get("is_echo") or message.get("historical"):
