@@ -530,6 +530,38 @@ class ZernioTests(unittest.IsolatedAsyncioTestCase):
         await self.flush_outgoing()
         self.assertEqual(self.mode_now(), "human")
 
+    async def test_photo_during_manual_takeover_stays_manual(self):
+        self.use_real_modes()
+        await self.receive()
+        self.clock += 5
+        await self.flush()
+        cid = conversations.conversation_id_of("zernio", "acc_a", "same-conversation")
+        conversations.dat_che_do(cid, "human")
+        await self.receive(self.image_event())
+        self.clock += 5
+        await self.flush()
+        self.assertNotIn("auto_handoff", self.delivery_state())
+        self.assertNotIn("processing", self.delivery_state())
+        await self.receive(self.sent_event())
+        await self.flush_outgoing()
+        self.assertEqual(self.mode_now(), "human")
+
+    async def test_stale_auto_handoff_cleared_when_ai_is_back(self):
+        self.use_real_modes()
+        await self.image_handoff()
+        cid = conversations.conversation_id_of("zernio", "acc_a", "same-conversation")
+        conversations.dat_che_do(cid, "ai")  # staff switch AI back in Javis without messaging
+        self.clock += 10
+        await self.receive(self.event("e2", "m2"))
+        self.clock += 5
+        await self.flush()
+        self.bot.answer_fn.assert_awaited_once()
+        self.assertNotIn("auto_handoff", self.delivery_state())
+        conversations.dat_che_do(cid, "human")  # later, a deliberate manual takeover
+        await self.receive(self.sent_event())
+        await self.flush_outgoing()
+        self.assertEqual(self.mode_now(), "human")
+
     async def test_automation_message_does_not_resume_ai(self):
         self.use_real_modes()
         await self.image_handoff()

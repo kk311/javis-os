@@ -892,14 +892,17 @@ def _has_media(messages) -> bool:
     return any(message.get("attachments") for message in messages or [])
 
 
-def _handoff(current):
+def _handoff(current, manual=False):
     """The bot steps aside for staff: drop the batch (it already lives in the inbox), no issue.
 
     `auto_handoff` marks that the bot chose this, so the next staff reply switches AI back on.
+    `manual`: staff already took the chat over by hand, so it stays theirs and is never auto-resumed.
     """
     for field in _BATCH_FIELDS + ("blocked_reason",):
         current.pop(field, None)
     current["messages"] = []
+    if manual and not current.get("auto_handoff"):
+        return
     current["handoff_pending"] = True
     current["auto_handoff"] = True
 
@@ -974,6 +977,7 @@ async def _flush_locked(key):
         handoff_pending = current.get("handoff_pending")
     if handoff_pending:
         _complete_handoff(key, bot)
+    staff_mode = conversations.che_do("zernio", bot.account_id, conversation_id) == "human"
     with _state_store.transaction() as state:
         current = state["conversations"][key]
         if not current.get("processing"):
@@ -1000,7 +1004,7 @@ async def _flush_locked(key):
         # model call, including captions and albums; the inbox already holds it.
         unsupported_media = _has_media(batch)
         if unsupported_media:
-            _handoff(current)
+            _handoff(current, manual=staff_mode)
 
     if unsupported_media:
         _complete_handoff(key, bot)
@@ -1041,6 +1045,10 @@ async def _flush_locked(key):
                     return
                 state["conversations"][key]["reply"] = reply
                 state["conversations"][key]["reply_created_at"] = _now()
+                if not state["conversations"][key].get("handoff_pending"):
+                    # AI is answering again, so an earlier auto handoff is over: a later manual
+                    # takeover must not be switched back by a stale flag.
+                    state["conversations"][key].pop("auto_handoff", None)
         if reply.strip() and active():
             with _state_store.transaction() as state:
                 current = state["conversations"][key]
