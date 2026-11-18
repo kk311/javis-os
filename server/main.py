@@ -3502,16 +3502,22 @@ def _resonance_agents_meta(root):
     """A1: trợ lý của brain cho trang Cộng hưởng: slug, tên và engine thật sự chạy phiên của nó (model riêng của trợ
     lý, hay bộ não chính khi trợ lý không chọn model) để giao diện báo đúng khả năng theo engine."""
     try:
-        main_prov = _chat_provider(cfgmod.read_settings().get("model", {}) or {})[0]
+        mcfg = cfgmod.read_settings().get("model", {}) or {}
+        main_prov = _chat_provider(mcfg)[0]
+        main_model = str(_effective_main({"model": mcfg}).get("model") or "")
     except Exception:  # noqa: BLE001
-        main_prov = ""
+        main_prov, main_model = "", ""
     out = []
     for a in agents_index(root, kem_prompt=False):
-        prov = _agent_model_provider(a.get("model") or "", a.get("model_provider") or "") if a.get("model") else main_prov
+        own = str(a.get("model") or "")
+        prov = _agent_model_provider(own, a.get("model_provider") or "") if own else main_prov
         # avatar: trang Nhóm vẽ đúng ảnh trợ lý đang dùng (cùng nhân dạng với trang Cộng sự).
         # title: vai của trợ lý (dòng "role" ở trang Cộng sự) cho gợi ý @ của trang Nhóm (0.142.0).
+        # model / model_label / model_main (owner, 18/11/2026: "trong team nhìn được model của các thành viên"): the
+        # model a team turn picks first (team_engine.choose_spec): the assistant's own, else the main model.
         out.append({"slug": a["slug"], "name": a.get("name") or a["slug"], "provider": prov, "avatar": a.get("avatar"),
-                    "title": str(a.get("role") or "")[:120]})
+                    "title": str(a.get("role") or "")[:120], "model": own or main_model,
+                    "model_label": str((_provider_def(prov) or {}).get("label") or prov), "model_main": not own})
     return out
 
 
@@ -7825,6 +7831,9 @@ async def settings_set(section: str = Form(...), data: str = Form("{}")):
         # 0.187.0: "hidden" = push notifications say only that something arrived, without its text.
         if "preview" in patch:
             cfg.setdefault("push", {})["preview"] = "hidden" if patch.get("preview") == "hidden" else "full"
+        if "turn_done" in patch:
+            # 2026-11-17: "all" = every dashboard answer rings when the owner is not looking at that chat.
+            cfg.setdefault("push", {})["turn_done"] = "all" if patch.get("turn_done") == "all" else "long"
     elif section == "zalo_bot":
         # Cùng khuôn với telegram. Id Zalo là chuỗi HEX chứ không phải số, nhưng `tg_parse_ids`
         # chỉ tách và bỏ trùng chứ không ép kiểu nên dùng chung được.
@@ -12940,6 +12949,8 @@ async def _phi_moi_muc(brain: str = "brain") -> dict:
         return (o[1] if o else {})
     phi = {k: int((v or {}).get("token_moi_request") or 0)
            for k, v in ((uoc or {}).get("muc") or {}).items()}
+    # The price per turn for the running tally, where the estimate gives one (see _uoc_tinh_tiet_kiem).
+    phi.update({k: int(v or 0) for k, v in ((uoc or {}).get("phi_tinh_cong_don") or {}).items()})
     _PHI_MUC_CACHE[khoa] = (time.time(), phi)
     return phi
 
@@ -15190,7 +15201,7 @@ async def _bo_vao_hom_thu(owner_chat, text, *, kind="answer", label="", source="
         # Giữ tham chiếu tới task, không thì bộ dọn rác có thể nuốt nó giữa chừng.
         t = asyncio.create_task(
             webpush.gui_het(title, body, url, tag=f"javis-{item['id']}", phien_hop_le=_phien_con_hieu_luc(),
-                            **({"quiet_if_visible": True} if push_if_away else {})))
+                            **({"quiet_if_visible": True, "session_id": sid} if push_if_away else {})))
         _PUSH_TASKS.add(t)
         t.add_done_callback(_PUSH_TASKS.discard)
     except Exception as e:
@@ -16399,7 +16410,7 @@ async def _bao_luot_dai_xong(conv_sid: str, brain, turn_tag: str, user_message: 
     (turn_done_notice.py). True when a notice was filed."""
     text = str(final_text or "")
     if not turn_done_notice.should_notify(elapsed, user_message, text):
-        return False
+        return _bao_luot_xong_ngan(conv_sid, text)
     import chat_bridge as _cb
     if _cb.co_viec(conv_sid):
         return False   # work an outside AI sent: chat_bridge rings once, and only if that AI did not read the answer
@@ -16410,6 +16421,35 @@ async def _bao_luot_dai_xong(conv_sid: str, brain, turn_tag: str, user_message: 
                                  label=turn_done_notice.label(elapsed, user_message), source="job",
                                  brain=_brain_key(brain), dedup=f"turn:{turn_tag}", push_if_away=True)
     return bool(item)
+
+
+def _bao_luot_xong_ngan(conv_sid: str, final_text: str) -> bool:
+    """A short dashboard turn ended and the owner turned on "notify every answer" (push.turn_done = "all"): push only,
+    no bell entry. The phone stays quiet when a tab in front of the owner shows this chat (sw.js asks the tab).
+    True when a push was scheduled."""
+    try:
+        st = cfgmod.read_settings()
+        if not turn_done_notice.every_turn(st) or not conv_sid or not webpush.so_sub():
+            return False
+        import chat_bridge as _cb
+        if _cb.co_viec(conv_sid):
+            return False
+        body = turn_done_notice.push_text(channel_context.strip_control_blocks(final_text))
+        if not body:
+            return False
+        if (st.get("push") or {}).get("preview") == "hidden":
+            body = localefmt.chu("Javis đã trả lời xong.", "Javis has answered.")
+        # Not awaited: a dead subscription waits up to 15 s and the turn is already over. One notice per chat: a newer
+        # answer replaces the older one (tag).
+        t = asyncio.create_task(webpush.gui_het(
+            "Javis", body, f"/?mo_phien={conv_sid}", tag=f"javis-turn-{conv_sid[:24]}",
+            phien_hop_le=_phien_con_hieu_luc(), quiet_if_visible=True, session_id=conv_sid))
+        _PUSH_TASKS.add(t)
+        t.add_done_callback(_PUSH_TASKS.discard)
+        return True
+    except Exception as e:  # noqa: BLE001 - a missed doorbell never fails the turn
+        print(f"[turn push] {type(e).__name__}: {e}", file=sys.stderr)
+        return False
 
 
 async def _canh_bao_hua_suong(brain: str, chat_id: str, final_text: str,
@@ -17405,6 +17445,9 @@ async def _start_scheduler():
                              session_probe=_manual_session_probe, session_undo=_manual_session_undo,
                              # 0.433.0: hear what is said in a video a customer sends (same Groq key as voice messages).
                              transcribe=_stt_nghe,
+                             # 2026-11-18: a photo a staff member sends from the Zalo OA app / Page inbox is read by a
+                             # connected brain, so the bot can answer about the quote in it.
+                             describe=lambda paths, caption, chat_id="": _bot_xem_ho(paths, caption, "", "", chat_id),
                              # 2026-11-08: a dedicated bot never polls the token of a running admin bot.
                              admin_tokens=_admin_bot_tokens,
                              # Lượt bot hỏng: khách không nhận gì, chủ nghe ở chuông thông báo (chủ repo 15/10/2026).
@@ -24885,8 +24928,16 @@ async def _uoc_tinh_tiet_kiem(brain: str = "brain") -> dict:
 
     Ba con số:
       - Tắt: gửi nguyên CLAUDE.md + chỉ mục bộ nhớ + khối skill + mô tả tool.
-      - Tối ưu: capsule nhỏ thay chỗ CLAUDE.md, vẫn kèm mô tả tool.
-      - Siêu tiết kiệm: như trên, và câu hỏi đơn giản đi thẳng không kèm mô tả tool.
+      - Tối ưu: the small capsule PLUS the base the compiler keeps (see below), with tool descriptions.
+      - Siêu tiết kiệm: a simple question goes straight with the capsule alone; others go as Tối ưu.
+
+    2026-11-18 (token saving, phase 3): the old figure for Tối ưu was capsule + tools and left out the base
+    (`source_fallback_contract`) that Phase 8 always sends with it (adaptive_context_runtime.prepare). That base
+    depends on the kind of brain: an API engine sends `build_adaptive_source_prompt` (no CLAUDE.md) plus the WHOLE
+    channel block; a subscription engine keeps CLAUDE.md ON PURPOSE (see `_subscription_system_prompt`) and drops
+    only the memory index and the skill block. The page said Tối ưu saved 84% on Claude Code too, while a real turn
+    sent about as much as Tắt, and the running tally (`usage_saving.tiet_kiem`) multiplied that by every turn.
+    Memory and skill parts loaded per question change with the question and are not counted here.
 
     Dùng CHÍNH hệ số ký tự-trên-token mà runtime đang dùng để ước lượng, để con số ở đây và
     con số ở chỗ khác không đá nhau. Đây là ƯỚC LƯỢNG: bộ đếm token thật của từng nhà cung
@@ -24917,6 +24968,15 @@ async def _uoc_tinh_tiet_kiem(brain: str = "brain") -> dict:
         cu = tok(await asyncio.to_thread(_dung_prompt_cu))
     except Exception:  # noqa: BLE001
         return {}
+    # Loại bộ não đang chạy: quyết định phần nền mức Tối ưu còn gửi, và mức Siêu tiết kiệm có đường tắt không.
+    # ĐỌC cấu hình thật, KHÔNG gõ cứng (lý do ở chỗ tính fast_hop bên dưới).
+    try:
+        _st = cfgmod.read_settings()
+        _prov, _kind, _k, _m = _chat_provider(_st.get("model", {}) or {})
+        _kinds_tat = [str(x) for x in (((_st.get("context_runtime") or {}).get("canary") or {})
+                                       .get("provider_kinds") or ["api"])]
+    except Exception:  # noqa: BLE001 - phần thông tin, không được làm sập trang
+        _kind, _kinds_tat = "api", ["api"]
     try:
         cc = context_compiler
         vien = tok(cc.CORE_CONTRACT
@@ -24925,6 +24985,21 @@ async def _uoc_tinh_tiet_kiem(brain: str = "brain") -> dict:
                    + cc.ContextCompiler._profile_section(cc.owner_profile())   # #1349: the capsule carries it too
                    + cc.dong_ho()
                    + cc.ContextCompiler._output_contract_text("dashboard"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+    def _dung_nen() -> str:
+        """The base Tối ưu still sends after the capsule, built as `_phase8_base` (API) and
+        `_subscription_system_prompt` (subscription) build it, with memory and skills loaded per question."""
+        kenh = channel_context.build_channel_block(
+            "dashboard", {"session_id": "uoc-tinh"}, telegram_running=bool(_TG_BOT),
+            port=_javis_port(), brain_root=_brain_root(brain))
+        if _kind == "api":
+            return build_adaptive_source_prompt(brain) + kenh
+        return build_system_prompt(brain, include_memory=False, include_skills=False) + kenh
+
+    try:
+        nen = tok(await asyncio.to_thread(_dung_nen))
     except Exception:  # noqa: BLE001
         return {}
     try:
@@ -24950,30 +25025,37 @@ async def _uoc_tinh_tiet_kiem(brain: str = "brain") -> dict:
     # gõ cứng này không ai nhớ sửa - nên trang vẫn dán nhãn "không áp cho bộ não đang dùng"
     # lên đúng mức vừa được mở, và chủ repo bấm vào rồi tưởng mình bấm nhầm. Đọc thẳng
     # provider_kinds của đường tắt thì lần sau mở thêm bộ não nào, trang tự đúng theo.
-    try:
-        _st = cfgmod.read_settings()
-        _prov, _kind, _k, _m = _chat_provider(_st.get("model", {}) or {})
-        _kinds_tat = [str(x) for x in (((_st.get("context_runtime") or {}).get("canary") or {})
-                                       .get("provider_kinds") or ["api"])]
-    except Exception:  # noqa: BLE001 - phần thông tin, không được làm sập trang
-        _kind, _kinds_tat = "api", ["api"]
     fast_hop = _kind in _kinds_tat
-    max_token = vien if fast_hop else (vien + cong_cu)
+    saving_token = vien + nen + cong_cu
+    max_token = vien if fast_hop else saving_token
     return {
         "chu_ky_ky_tu_tren_token": ratio,
         "la_uoc_luong": True,
         "kind_bo_nao": _kind,
-        "chi_tiet": {"claude_md_va_bo_nho": cu, "capsule": vien, "mo_ta_cong_cu": cong_cu},
+        "chi_tiet": {"claude_md_va_bo_nho": cu, "capsule": vien, "nen_giu_lai": nen, "mo_ta_cong_cu": cong_cu},
+        # Cost per turn for the running saving tally (usage_saving.tiet_kiem). Only SIMPLE questions take the
+        # shortcut of the max level; the rest go the Optimized route, and how many do is not known here. Counting
+        # every turn at the shortcut price is what made the tally overstate, so it counts the max level at the
+        # Optimized price: the measured section of the page shows what the shortcut really saved.
+        "phi_tinh_cong_don": {"off": goc, "saving": saving_token, "max": saving_token},
         "muc": {
             "off": {"token_moi_request": goc, "phan_tram": 0, "ap_dung": True,
                     "ghi_chu": localefmt.chu("Gửi nguyên bộ luật, bộ nhớ và danh sách skill mỗi lượt.",
                                              "Sends the full rules, memory and skill list every turn.")},
-            "saving": {"token_moi_request": vien + cong_cu, "phan_tram": muc(vien + cong_cu),
+            "saving": {"token_moi_request": saving_token, "phan_tram": muc(saving_token),
                        "ap_dung": True,
-                       "ghi_chu": localefmt.chu(
-                           "Thay bộ luật dài bằng bản rút gọn; nhớ và skill chỉ nạp phần liên quan.",
-                           "Replaces the long rules with a short version; memory and skills load only "
-                           "what is relevant.")},
+                       "ghi_chu": (localefmt.chu(
+                           "Thay bộ luật dài bằng bản rút gọn, vẫn giữ luật của kênh chat; nhớ và skill chỉ "
+                           "nạp phần liên quan.",
+                           "Replaces the long rules with a short version and keeps the chat channel rules; "
+                           "memory and skills load only what is relevant.")
+                                   if _kind == "api" else
+                                   localefmt.chu(
+                           "Gói thuê bao không tính tiền theo token nên giữ nguyên bộ luật; mức này chỉ nạp "
+                           "phần liên quan của bộ nhớ và skill. Brain càng nhiều ghi nhớ và skill thì càng bớt.",
+                           "A subscription plan is not billed per token, so the full rules stay; this level "
+                           "loads only the relevant memory and skills. The more memories and skills a brain "
+                           "has, the more it saves."))},
             "max": {"token_moi_request": max_token, "phan_tram": muc(max_token),
                     "ap_dung": fast_hop,
                     "ghi_chu": (localefmt.chu(
@@ -30194,13 +30276,16 @@ def _chan_ngoai_le(raw, cu, xac_nhan):
 
 
 @app.get("/chatbots/chats")
-async def chatbots_chats(account_ids: str = "", bot_id: str = "", q: str = "", limit: int = 60):
+async def chatbots_chats(account_ids: str = "", bot_id: str = "", q: str = "", limit: int = 60, chon: str = ""):
     """Các cuộc chat ĐÃ BIẾT (người và nhóm) cho ô "chọn người và nhóm" của form bot.
 
     Nguồn là Hộp thư (`conversations`) nên có tên hiển thị thật thay vì id. `account_ids` (cách nhau
     bằng dấu phẩy) là các tài khoản kênh ĐANG TÍCH trong form, kể cả khi bot chưa tồn tại; `bot_id`
     thêm hàng chờ duyệt và cờ "đã chọn". Phải đăng ký TRƯỚC mọi route có `{bot_id}` để "chats" không
     bị coi là id bot.
+
+    `chon` (id cách nhau bằng dấu phẩy) là các cuộc chat form ĐANG TÍCH: `ten` trả tên của chúng (cùng mọi id bot đã
+    lưu) dù ô tìm hay giới hạn trang để chúng ra ngoài danh sách, để form không vẽ chúng thành id trần.
     """
     bot = chatbot_store.get_bot(bot_id) if bot_id else None
     ids = [x.strip() for x in str(account_ids or "").split(",") if x.strip()]
@@ -30210,7 +30295,10 @@ async def chatbots_chats(account_ids: str = "", bot_id: str = "", q: str = "", l
     else:
         tk = list((bot or {}).get("accounts") or [])
     cho = chatbot_runtime.nhom_cho(bot_id) if bot else []
-    return {"ok": True, "chats": chatbot_cuoc_chat.danh_sach(tk, q, limit, cho, bot)}
+    can_ten = [x.strip() for x in str(chon or "").split(",") if x.strip()]
+    can_ten += [str(x) for x in list((bot or {}).get("groups") or []) + list((bot or {}).get("people") or [])]
+    return {"ok": True, "chats": chatbot_cuoc_chat.danh_sach(tk, q, limit, cho, bot),
+            "ten": chatbot_cuoc_chat.ten_da_chon(tk, can_ten)}
 
 
 @app.get("/chatbots/zalo-labels")
@@ -31961,6 +32049,11 @@ def _team_engine_for(team, agent_key, role):
             except Exception:  # noqa: BLE001 - Codex reports its own sign-in error
                 pass
         _step_plan_account(eng, prov)   # the plan account that should run now (rotation, as in chat)
+        if prov == aux_engine.CLAUDE and steer_inbox.INBOX.has_tag(tag):
+            # 18/11/2026: this step reads the owner's messages to its member after each tool call. ClaudeSDK only turns
+            # its steer hook on for chat tags; switched on here, on this one engine, so claude_sdk_engine.py keeps the
+            # bytes its native qualification pinned (test_plan_limits CANARY). The hook finds the step by its tag.
+            eng._steer_on = lambda _t=tag: steer_inbox.INBOX.has_tag(_t)
         avail = getattr(eng, "is_available", None)
         if callable(avail) and not avail():
             raise team_runner.EngineUnavailable(f"engine {tool_spec['provider']} chưa sẵn sàng (kiểm tra trang Models)")
@@ -31994,6 +32087,10 @@ def _team_engine_for(team, agent_key, role):
         # 10/11/2026: a plan account out of quota rests and the turn runs again at once on the card's next account, as
         # a chat turn does (spec 6.4). `moved` is the line the message carries when that happened.
         hops, moved = 0, ""
+        if tools_on and req.get("steer_sid"):
+            # 18/11/2026: the owner's messages to this member reach the step at its next tool call (Claude Code hook by
+            # tag; the API engines read the turn's inbox from the context).
+            steer_inbox.INBOX.attach_tag(str(req["steer_sid"]), tag)
         while True:
             if tools_on:
                 eng = await asyncio.to_thread(_build_tools, req["system"], tag, str(req.get("team_gate") or ""))
@@ -32197,11 +32294,23 @@ _TEAM_ASKS_OWNER = re.compile(r"gọi bạn trong nhóm|called you in team|chờ
                               r"xin duyệt|asks for approval|vẫn đang chờ bạn|still waiting for you", re.I)
 
 
-async def _team_notify(session_id, text):
+async def _team_notify(session_id, text, ref=""):
     asks = bool(_TEAM_ASKS_OWNER.search(str(text or "")))
+    # `ref` (18/11/2026): the notice is filed under it, so `_team_notice_done` clears it once the owner answered.
     await _bo_vao_hom_thu(f"{WEB_CHAT_PREFIX}{session_id}", text, kind="report",
                           label=localefmt.chu("Team", "Team"), source="team",
-                          group="question" if asks else "team", level="urgent" if asks else "important")
+                          group="question" if asks else "team", level="urgent" if asks else "important",
+                          dedup=str(ref or ""))
+
+
+async def _team_notice_done(ref):
+    """An approval request of a team was answered: its notice in the bell turns read, and open tabs refresh the bell."""
+    changed = await asyncio.to_thread(inbox.read_by_dedup, str(ref or ""))
+    if changed:
+        try:
+            await _CHAT_RUNTIME.publish({"type": "inbox", "session_id": "", "cleared": True})
+        except Exception as e:  # noqa: BLE001 - the bell refreshes on its next load anyway
+            print(f"[inbox] bắn WebSocket lỗi: {type(e).__name__}: {e}", file=sys.stderr)
 
 
 _FEEDBACK_PROJECTOR = [None]
@@ -32766,7 +32875,8 @@ _TEAM_API = team_api.register(app, team_api.TeamApiDeps(
     task_store=lambda: tasks_feature.store, resonance_store=lambda: _resonance_store(),
     agents_meta=_resonance_agents_meta, agent_info=lambda root, key: _team_agent_info(root, key, "team"),
     engine_for=_team_engine_for,
-    broadcast=lambda ev: _CHAT_RUNTIME.publish(ev), notify=_team_notify, admin=_TeamAdmin(),
+    broadcast=lambda ev: _CHAT_RUNTIME.publish(ev), notify=_team_notify, notice_done=_team_notice_done,
+    admin=_TeamAdmin(),
     owner_name=lambda: ((cfgmod.read_settings().get("auth") or {}).get("username") or ""),
     ceiling=_team_ceiling, projector=_feedback_projector, judge=lambda: _agent_judge(),
     learning=_team_learning,
