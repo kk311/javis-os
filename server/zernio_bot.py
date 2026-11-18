@@ -46,6 +46,8 @@ from zernio_delivery import classify_delivery, retry_delay
 STATE_FILE = cfgmod.STATE_DIR / "zernio_state.json"
 MAX_AGE_SECONDS = 48 * 3600  # 48 hours for deduplication TTL
 BATCH_SECONDS = 5.0
+# A conversation with nothing pending, no staff pause and no handoff flag is dropped from the journal after this.
+CONVERSATION_IDLE_SECONDS = 14 * 86400
 API_BASE = "https://zernio.com/api/v1"
 MAX_BODY_BYTES = 256 * 1024
 # Owner 2026-11-18: once staff answers a customer (Instagram app, Zernio dashboard, Javis inbox), the bot
@@ -218,46 +220,104 @@ def verify_signature(raw: bytes, signature: str, secret: str) -> bool:
 # Durable Deduplication & Batching State Store
 # ============================================================
 class DurableState:
-    """Transactional SQLite journal. Import legacy JSON once; never discard corrupt data.
+    """Transactional SQLite journal, one row per event, message and conversation.
 
-    A separate SQLite write lock per conversation serializes model/send work across
-    processes without holding the shared journal transaction over a network await.
-    OS closes those locks automatically after a worker crash.
+    Before 2026-11-18 the whole journal was ONE JSON cell rewritten on every webhook and flush
+    (326 KB live, 127 conversations that were never removed). Rows are now written only when they
+    changed, and `prune` drops idle conversations. The old `journal` table is left untouched as a
+    rollback copy; `meta.migrated` marks that its content was imported.
+
+    The caller still sees one dict (`events`, `messages`, `conversations`, `outgoing`, ...), so the
+    code that uses `transaction()` did not change. A separate SQLite write lock per conversation
+    serializes model/send work across processes without holding the journal transaction over a
+    network await. The OS closes those locks automatically after a worker crash.
     """
+    SECTIONS = ("events", "messages", "conversations", "outgoing")
+    LOCK_SWEEP_SECONDS = 30 * 86400
+
     def __init__(self, file_path: Path):
         self.file_path = file_path
         self.db_path = file_path.with_suffix(".sqlite3")
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as db:
+        db = self._connect()
+        try:
+            db.execute("PRAGMA journal_mode=WAL")
             db.execute("CREATE TABLE IF NOT EXISTS journal (id INTEGER PRIMARY KEY, data TEXT NOT NULL)")
-            row = db.execute("SELECT id FROM journal WHERE id=1").fetchone()
-            if not row:
-                data = json.loads(file_path.read_text()) if file_path.exists() else {}
+            db.execute("CREATE TABLE IF NOT EXISTS rows (section TEXT NOT NULL, k TEXT NOT NULL, "
+                       "v TEXT NOT NULL, PRIMARY KEY (section, k))")
+            db.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+            db.commit()
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM meta WHERE k='migrated'").fetchone():
+                row = db.execute("SELECT data FROM journal WHERE id=1").fetchone()
+                data = json.loads(row[0]) if row else (json.loads(file_path.read_text()) if file_path.exists() else {})
                 for key in ("events", "messages", "conversations"):
                     data.setdefault(key, {})
                 data["messages"] = {json.dumps(k.split(":", 1), separators=(",", ":")) if ":" in k and not k.startswith("[") else k: v
                                     for k, v in data["messages"].items()}
-                db.execute("INSERT OR IGNORE INTO journal VALUES(1, ?)", (json.dumps(data),))
+                self._write(db, {}, data)
+                db.execute("INSERT OR REPLACE INTO meta VALUES('migrated', '1')")
+            db.commit()
+        finally:
+            db.close()
         os.chmod(self.db_path, 0o600)
+        self._sweep_locks()
 
     def _connect(self):
         return sqlite3.connect(self.db_path, timeout=10)
+
+    @staticmethod
+    def _flatten(data: dict) -> dict:
+        """{(section, key): json text}. Sections hold dicts; any other top-level value is one `_misc` row."""
+        out = {}
+        for name, value in data.items():
+            if name in DurableState.SECTIONS and isinstance(value, dict):
+                for k, v in value.items():
+                    out[(name, str(k))] = json.dumps(v, sort_keys=True)
+            else:
+                out[("_misc", name)] = json.dumps(value, sort_keys=True)
+        return out
+
+    def _read(self, db) -> Tuple[dict, dict]:
+        data = {name: {} for name in self.SECTIONS}
+        snapshot = {}
+        for section, k, v in db.execute("SELECT section, k, v FROM rows"):
+            snapshot[(section, k)] = v
+            if section == "_misc":
+                data[k] = json.loads(v)
+            else:
+                data.setdefault(section, {})[k] = json.loads(v)
+        return data, snapshot
+
+    def _write(self, db, before: dict, data: dict):
+        after = self._flatten(data)
+        for key in before.keys() - after.keys():
+            db.execute("DELETE FROM rows WHERE section=? AND k=?", key)
+        for key, text in after.items():
+            if before.get(key) != text:
+                db.execute("INSERT OR REPLACE INTO rows VALUES(?,?,?)", (key[0], key[1], text))
 
     @contextmanager
     def transaction(self):
         db = self._connect()
         try:
             db.execute("BEGIN IMMEDIATE")
-            data = json.loads(db.execute("SELECT data FROM journal WHERE id=1").fetchone()[0])
+            data, snapshot = self._read(db)
+            # A snapshot holds the exact text read, so `before.get(key) != text` below must compare like
+            # with like: re-serialize what was read, not the raw column.
+            snapshot = self._flatten(data)
             yield data
-            db.execute("UPDATE journal SET data=? WHERE id=1", (json.dumps(data),))
+            self._write(db, snapshot, data)
             db.commit()
         finally:
             db.close()
 
     def load(self) -> dict:
-        with self._connect() as db:
-            return json.loads(db.execute("SELECT data FROM journal WHERE id=1").fetchone()[0])
+        db = self._connect()
+        try:
+            return self._read(db)[0]
+        finally:
+            db.close()
 
     def save(self, data: dict):
         # Compatibility helper for migration/tests. Production uses transaction().
@@ -277,9 +337,32 @@ class DurableState:
             return None
         return db
 
+    def _sweep_locks(self):
+        """Lock files are one per conversation and were never removed: drop the ones idle for 30 days."""
+        directory = self.db_path.parent / "zernio-locks"
+        if not directory.is_dir():
+            return
+        cutoff = time.time() - self.LOCK_SWEEP_SECONDS
+        for path in directory.glob("*.sqlite3*"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                pass
+
     def prune(self, data: dict, now: float) -> dict:
         for key in ("events", "messages"):
             data[key] = {k: v for k, v in data[key].items() if float(v.get("ts") or now) > now - MAX_AGE_SECONDS}
+        for key, current in list(data.get("conversations", {}).items()):
+            current.setdefault("touched", now)
+            busy = (current.get("messages") or current.get("processing") or current.get("handoff_pending")
+                    or current.get("auto_handoff") or current.get("resume_ai_pending"))
+            if not busy and float(current.get("staff_until") or 0) < now \
+                    and float(current["touched"]) < now - CONVERSATION_IDLE_SECONDS:
+                del data["conversations"][key]
+        data["quarantined_batches"] = (data.get("quarantined_batches") or [])[-50:]
+        if not data["quarantined_batches"]:
+            data.pop("quarantined_batches")
         return data
 
 
@@ -687,6 +770,7 @@ def _conversation_state(state, bot, conversation_id):
         current = {"messages": [], "account_id": bot.provider_account_id, "conversation_id": conversation_id,
                    "javis_account_id": bot.account_id, "bot_id": bot.bot_id}
         state["conversations"][key] = current
+    current["touched"] = _now()
     return key, current
 
 

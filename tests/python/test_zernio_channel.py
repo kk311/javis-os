@@ -1138,6 +1138,44 @@ sys.stdin.read()
         await self.receive(event)
         self.assertEqual((self.inbox[-1]["message_type"], self.inbox[-1]["text"]), ("image", "[Bài đăng] Kem má hồng ELF sale"))
 
+    def test_journal_writes_only_changed_rows(self):
+        with self.store.transaction() as state:
+            state["events"]["e1"] = {"ts": self.clock}
+            state["conversations"]["a"] = {"messages": [], "touched": self.clock}
+        db = sqlite3.connect(self.store.db_path)
+        db.execute("UPDATE rows SET v=? WHERE section='events' AND k='e1'", ('{"ts": 999}',))
+        db.commit()
+        db.close()
+        with self.store.transaction() as state:
+            state["conversations"]["a"]["x"] = 1
+        db = sqlite3.connect(self.store.db_path)
+        self.assertEqual(db.execute("SELECT v FROM rows WHERE section='events' AND k='e1'").fetchone()[0], '{"ts": 999}')
+        db.close()
+
+    def test_old_single_blob_journal_is_migrated_once(self):
+        path = Path(self.directory.name) / "old.json"
+        db = sqlite3.connect(path.with_suffix(".sqlite3"))
+        db.execute("CREATE TABLE journal (id INTEGER PRIMARY KEY, data TEXT NOT NULL)")
+        db.execute("INSERT INTO journal VALUES (1, ?)", (json.dumps(
+            {"events": {"e": {"ts": 1}}, "messages": {}, "conversations": {"k": {"messages": []}}}),))
+        db.commit()
+        db.close()
+        first = z.DurableState(path).load()
+        self.assertEqual(first["conversations"], {"k": {"messages": []}})
+        with z.DurableState(path).transaction() as state:
+            state["conversations"].clear()
+        self.assertEqual(z.DurableState(path).load()["conversations"], {})
+
+    def test_idle_conversations_are_pruned_but_busy_ones_stay(self):
+        old = self.clock - z.CONVERSATION_IDLE_SECONDS - 10
+        state = {"events": {}, "messages": {}, "conversations": {
+            "idle": {"messages": [], "touched": old},
+            "busy": {"messages": [{"id": "m"}], "touched": old},
+            "paused": {"messages": [], "touched": old, "staff_until": self.clock + 60},
+            "fresh": {"messages": [], "touched": self.clock}}}
+        left = set(self.store.prune(state, self.clock)["conversations"])
+        self.assertEqual(left, {"busy", "paused", "fresh"})
+
 
 if __name__ == "__main__":
     unittest.main()
