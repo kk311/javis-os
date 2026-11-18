@@ -115,23 +115,21 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         replacement.answer_fn.assert_not_awaited()
         self.assertFalse([e for e in self.inbox if e['sender_type'] == 'ai'])
 
-    async def test_concurrent_issue_resolution_after_media_handoff(self):
+    async def test_media_handoff_marks_auto_handoff_without_issue(self):
         self.mode_patch.stop()
+        cid = conversations.conversation_id_of('zernio','acc_a','same-conversation')
+        if cid:
+            conversations.dat_che_do(cid, 'ai')
         event = self.event()
         event['message']['attachments'] = [{'type':'image','url':'https://invalid.example/image'}]
         await self.receive(event)
         self.clock += 5
         await self.flush()
-        issue = z.delivery_issues('acc_a')[0]
-        with patch('chatbot_store.bots_using_account', return_value=[{'id':'bot_a'}]):
-            results = await asyncio.gather(*[
-                asyncio.to_thread(z.resolve_delivery_issue, 'acc_a', issue['id'], issue['revision'])
-                for _ in range(2)])
-        self.assertEqual(sorted(results), [200,409])
         key = z._batch_key('provider-a','same-conversation')
         current = z.DurableState(self.store.file_path).load()['conversations'][key]
-        self.assertEqual(len(current['delivery_history']), 1)
-        self.assertEqual(current['delivery_history'][0]['batch']['processing'][0]['attachments'], event['message']['attachments'])
+        self.assertTrue(current['auto_handoff'])
+        for field in ('delivery_issue', 'delivery_batch', 'processing'):
+            self.assertNotIn(field, current)
         self.assertEqual(conversations.che_do('zernio','acc_a','same-conversation'), 'human')
         await self.flush()
         self.bot.answer_fn.assert_not_awaited()

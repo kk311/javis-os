@@ -52,6 +52,7 @@ MAX_BODY_BYTES = 256 * 1024
 # stays quiet this long. Customer messages that arrive meanwhile wait; if staff still has not answered when
 # the pause ends, the bot answers them.
 STAFF_PAUSE_SECONDS = 300.0
+_BATCH_FIELDS = ("processing", "reply", "reply_created_at", "send_key", "attempts", "next_retry_at")
 # A `message.sent` echo is written to the inbox after this delay, so a send from the Javis inbox (which
 # writes its own row right after the API call returns) is matched instead of stored twice.
 OUTGOING_SETTLE_SECONDS = 8.0
@@ -652,11 +653,9 @@ def _staff_answered(current, now):
     current["staff_at"] = now
     # Pending customer messages are already in the inbox; staff answered them.
     current["messages"] = []
-    # A reply the bot is still preparing or retrying is dropped. A batch already archived for staff
-    # (delivery_batch / handoff_pending) keeps its evidence untouched.
-    if current.get("processing") and not current.get("delivery_batch") and not current.get("handoff_pending"):
-        for field in ("processing", "reply", "reply_created_at", "send_key", "attempts", "next_retry_at",
-                      "delivery_issue"):
+    # A reply the bot is still preparing or retrying is dropped.
+    if current.get("processing"):
+        for field in _BATCH_FIELDS:
             current.pop(field, None)
 
 
@@ -839,6 +838,9 @@ def resume_pending(provider_id):
             current.pop("takeover", None)
             current.pop("replies_in_window", None)
             state["conversations"][key] = state["conversations"].pop(old_key)
+        for current in state["conversations"].values():
+            if current.get("account_id") == provider_id:
+                _clean_legacy_issue(bot, current)
     snapshot = _state_store.load()
     for out_key, entry in (snapshot.get("outgoing") or {}).items():
         if entry.get("account_id") == provider_id:
@@ -850,6 +852,22 @@ def resume_pending(provider_id):
             elif current.get("messages") or current.get("processing"):
                 due = current.get("next_retry_at") if current.get("processing") else current.get("due_at")
                 _arm_timer(key, max(0, (due or _now()) - _now()))
+
+
+def _clean_legacy_issue(bot, current):
+    """Before 2026-11-18 media and failed sends parked a batch as a "delivery issue" for staff.
+
+    That panel is gone: drop the parked batch (it already lives in the inbox, nothing is resent), and
+    let the next staff reply bring AI back if the conversation was left with staff.
+    """
+    if not (current.get("delivery_issue") or current.get("delivery_batch")):
+        return
+    for field in ("delivery_issue", "delivery_batch", "delivery_history"):
+        current.pop(field, None)
+    current["messages"] = []
+    conversation_id = current.get("conversation_id")
+    if conversation_id and conversations.che_do("zernio", bot.account_id, conversation_id) == "human":
+        current["auto_handoff"] = True
 
 
 async def _flush(key):
@@ -870,59 +888,6 @@ async def _flush(key):
         guard.close()
 
 
-def delivery_issues(account_id: str) -> list:
-    """Only public metadata for the requested Javis account, never batch contents."""
-    result = []
-    for current in _state_store.load()["conversations"].values():
-        issue = current.get("delivery_issue")
-        if current.get("javis_account_id") != account_id or not issue:
-            continue
-        public = {k: issue.get(k) for k in
-                  ("id", "revision", "reason", "attempts", "next_retry_at", "created_at")}
-        public["conversation_id"] = conversations.conversation_id_of(
-            "zernio", account_id, current["conversation_id"])
-        result.append(public)
-    return result
-
-
-def resolve_delivery_issue(account_id: str, issue_id: str, revision: int) -> int:
-    """CAS under the same cross-process conversation lock as flush. No sending."""
-    import chatbot_store
-    snapshot = _state_store.load()
-    key = next((key for key, c in snapshot["conversations"].items()
-                if c.get("javis_account_id") == account_id and
-                ((c.get("delivery_issue") or {}).get("id") == issue_id or
-                 any(h["issue"]["id"] == issue_id for h in c.get("delivery_history", [])))), None)
-    if key is None:
-        return 404
-    guard = _state_store.conversation_lock(key)
-    if guard is None:
-        return 409
-    try:
-        with _state_store.transaction() as state:
-            current = state["conversations"].get(key) or {}
-            issue = current.get("delivery_issue") or {}
-            assigned = chatbot_store.bots_using_account(account_id)
-            if (current.get("javis_account_id") != account_id or issue.get("id") != issue_id
-                    or issue.get("revision") != revision or not current.get("delivery_batch")
-                    or current.get("handoff_pending") or len(assigned) != 1
-                    or assigned[0].get("id") != current.get("bot_id")):
-                return 409
-            current.setdefault("delivery_history", []).append({
-                "issue": dict(issue, revision=revision + 1), "batch": current.pop("delivery_batch"),
-                "resolution": "handled_by_staff", "resolved_at": _now()})
-            current.pop("delivery_issue")
-            # These messages already exist in the inbox. Recovery must not enqueue
-            # them or enable AI; only future incoming messages can form a new batch.
-            current["messages"] = []
-        return 200
-    finally:
-        guard.close()
-
-
-_BATCH_FIELDS = ("processing", "reply", "reply_created_at", "send_key", "attempts", "next_retry_at")
-
-
 def _has_media(messages) -> bool:
     return any(message.get("attachments") for message in messages or [])
 
@@ -932,7 +897,7 @@ def _handoff(current):
 
     `auto_handoff` marks that the bot chose this, so the next staff reply switches AI back on.
     """
-    for field in _BATCH_FIELDS + ("delivery_issue", "delivery_batch", "blocked_reason"):
+    for field in _BATCH_FIELDS + ("blocked_reason",):
         current.pop(field, None)
     current["messages"] = []
     current["handoff_pending"] = True
@@ -966,7 +931,7 @@ def _delivery_failed(current, bot, reason):
     Runs inside the journal transaction; a bell failure aborts it so the batch is retried.
     """
     _ring_failure(bot, current, reason)
-    for field in _BATCH_FIELDS + ("delivery_issue", "delivery_batch", "blocked_reason"):
+    for field in _BATCH_FIELDS + ("blocked_reason",):
         current.pop(field, None)
 
 
@@ -1011,10 +976,6 @@ async def _flush_locked(key):
         _complete_handoff(key, bot)
     with _state_store.transaction() as state:
         current = state["conversations"][key]
-        if current.get("delivery_batch"):
-            # New messages already live in the inbox; never retry the archived batch.
-            current["messages"] = []
-            return
         if not current.get("processing"):
             delay = current.get("due_at", 0) - _now()
             if delay > 0:
@@ -1146,7 +1107,7 @@ async def _flush_locked(key):
         current.pop("processing", None)
         current.pop("reply", None)
         current.pop("reply_created_at", None)
-        for field in ("send_key", "attempts", "next_retry_at", "delivery_issue"):
+        for field in ("send_key", "attempts", "next_retry_at"):
             current.pop(field, None)
         if current.get("messages"):
             _arm_timer(key, max(0, current.get("due_at", _now()) - _now()))

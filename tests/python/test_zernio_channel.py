@@ -586,6 +586,53 @@ class ZernioTests(unittest.IsolatedAsyncioTestCase):
             await self.flush()
         self.assertEqual(self.mode_now(), "ai")
 
+    async def test_legacy_issue_state_is_cleaned_and_resumable(self):
+        self.use_real_modes()
+        await self.receive()
+        self.clock += 5
+        await self.flush()
+        self.bot.send_delivery.reset_mock()
+        cid = conversations.conversation_id_of("zernio", "acc_a", "same-conversation")
+        conversations.dat_che_do(cid, "human")
+        key = z._batch_key("provider-a", "same-conversation")
+        with self.store.transaction() as state:
+            current = state["conversations"][key]
+            current["delivery_issue"] = {"id": "zernio-old", "revision": 1, "reason": "unsupported_media"}
+            current["delivery_batch"] = {"processing": [{"id": "old"}], "send_key": "zernio-old"}
+            current["handoff_pending"] = False
+            current["messages"] = [{"id": "old-2"}]
+        self.restart_delivery()
+        current = self.delivery_state()
+        for field in ("delivery_issue", "delivery_batch"):
+            self.assertNotIn(field, current)
+        self.assertEqual(current["messages"], [])
+        self.assertTrue(current.get("auto_handoff"))
+        await self.flush()
+        self.bot.send_delivery.assert_not_awaited()
+        self.assertEqual(self.mode_now(), "human")
+        await self.receive(self.sent_event())
+        await self.flush_outgoing()
+        self.assertEqual(self.mode_now(), "ai")
+
+    async def test_legacy_issue_in_ai_mode_is_cleaned_without_handoff_flag(self):
+        self.use_real_modes()
+        await self.receive()
+        self.clock += 5
+        await self.flush()
+        key = z._batch_key("provider-a", "same-conversation")
+        with self.store.transaction() as state:
+            state["conversations"][key]["delivery_issue"] = {"id": "zernio-old", "revision": 1}
+        self.restart_delivery()
+        current = self.delivery_state()
+        self.assertNotIn("delivery_issue", current)
+        self.assertNotIn("auto_handoff", current)
+
+    def test_issue_routes_removed(self):
+        table = json.loads((Path(__file__).parent / "route_table.json").read_text())
+        self.assertFalse([r for r in table if "delivery-issues" in str(r.get("path"))])
+        self.assertFalse(hasattr(z, "delivery_issues"))
+        self.assertFalse(hasattr(z, "resolve_delivery_issue"))
+
     def mock_provider(self, status=503, retry_after=None, error=None):
         from types import SimpleNamespace
         client = AsyncMock()
