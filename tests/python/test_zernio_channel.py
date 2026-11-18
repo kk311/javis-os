@@ -622,6 +622,24 @@ class ZernioTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.mode_now(), "human")
         self.assertTrue(self.delivery_state().get("auto_handoff"))
 
+    def test_bot_echo_is_matched_by_id_once_known(self):
+        text = "Dạ shop chưa hiểu ạ, mình mô tả thêm giúp shop nha."
+        now = 1000.0
+        # Reply accepted with an id: staff typing the very same words is not taken for the bot.
+        cur = {"bot_sent": [{"t": z._norm_text(text), "ts": now, "id": "m-1"}]}
+        self.assertFalse(z._is_bot_echo(cur, {"id": "m-2", "text": text}, now + 5))
+        self.assertTrue(z._is_bot_echo(cur, {"id": "m-1", "platformMessageId": "x", "text": "whatever"}, now + 6))
+        self.assertEqual(cur["bot_sent"], [])
+        # Id not known yet (reply in flight, or no id in the response): fall back to the words.
+        cur = {"bot_sent": [{"t": z._norm_text(text), "ts": now}]}
+        self.assertTrue(z._is_bot_echo(cur, {"id": "m-3", "text": text}, now + 1))
+
+    def test_send_response_message_id(self):
+        ok = MagicMock(); ok.json.return_value = {"success": True, "data": {"messageId": "abc", "conversationId": "c"}}
+        self.assertEqual(z._response_message_id(ok), "abc")
+        bad = MagicMock(); bad.json.side_effect = ValueError("no body")
+        self.assertEqual(z._response_message_id(bad), "")
+
     async def test_staff_reply_wins_over_pending_handoff(self):
         self.use_real_modes()
         await self.receive(self.image_event())

@@ -78,11 +78,16 @@ class ZernioSetupTests(unittest.TestCase):
     def test_creation_pins_verified_key_and_blank_update_reverifies(self):
         aid = self.create()
         stored = json.loads(channel_accounts.get_token(aid))
-        self.assertEqual(stored["api_key"], "private-connection-b")
-        self.assertNotIn("connection_id", stored)
-        # Changing/removing the source cannot silently select a different key at runtime.
-        self.connections.clear()
+        # The key stays in the connection; the account only points at it, so a rotation reaches it.
+        self.assertNotIn("api_key", stored)
+        self.assertEqual(stored["connection_id"], "connection-b")
         self.assertEqual(z.split_credentials(channel_accounts.get_token(aid))["api_key"], "private-connection-b")
+        # Removing the connection never makes the account borrow another connection's key.
+        kept = list(self.connections)
+        self.connections.clear()
+        self.assertEqual(z.split_credentials(channel_accounts.get_token(aid))["api_key"], "")
+        self.assertEqual(z.split_credentials(channel_accounts.get_token(aid))["connection_id"], "connection-b")
+        self.connections[:] = kept
         with patch.object(z, "_rest_accounts", side_effect=z.CredentialsError("invalid_api_key")):
             response = self.client.post(f"/channels/accounts/{aid}/update", data={"label": "must not save", "token": ""})
             self.assertEqual(response.status_code, 400)
@@ -96,6 +101,23 @@ class ZernioSetupTests(unittest.TestCase):
         self.assertNotIn("private-signing", response.text)
         self.assertNotIn('"api_key"', response.text)
         self.assertFalse(response.json()["account"]["meta"]["webhook_secret_verified"])
+
+    def test_connection_secret_and_key_rotation_reach_accounts(self):
+        creds = self.credentials()
+        creds.pop("secret")
+        secrets = {"connection-b": {"api_key": "key-1", "webhook_secret": "whsec-1"}}
+        with patch.object(mcp_store, "connection_secrets", side_effect=lambda cid: dict(secrets.get(cid, {}))):
+            self.assertEqual(z.split_credentials(creds)["secret"], "whsec-1")
+            stored = z.storable_credentials(z.split_credentials(creds))
+            self.assertNotIn("api_key", stored)
+            self.assertNotIn("secret", stored)
+            secrets["connection-b"] = {"api_key": "key-2", "webhook_secret": "whsec-2"}
+            now = z.split_credentials(stored)
+            self.assertEqual((now["api_key"], now["secret"]), ("key-2", "whsec-2"))
+            self.assertIn("whsec-2", z._known_secrets())
+            # An account's own secret is kept when it differs from the connection's.
+            own = z.storable_credentials(z.split_credentials(dict(creds, secret="own-secret")))
+            self.assertEqual(own["secret"], "own-secret")
 
     def test_generic_assignment_works_for_two_different_bots_without_enabling(self):
         aid = self.create()

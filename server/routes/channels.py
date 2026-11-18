@@ -216,12 +216,12 @@ def register(app, deps: ChannelsDeps):
         ext = str(bot_username or "").strip()
         meta = {}
         if channel == "zernio":
-            from zernio_bot import split_credentials
+            from zernio_bot import split_credentials, storable_credentials
             credentials = split_credentials(token)
             if not credentials["api_key"]:
                 return _400(localefmt.chu("Thiếu API key hoặc kết nối Zernio không hợp lệ",
                                          "Missing API key or invalid Zernio connection"), code="missing_api_key")
-            token = json.dumps(credentials)
+            token = json.dumps(storable_credentials(credentials))
         if not ext or channel == "zernio":
             r = await verify_token(channel, token)
             if isinstance(r, JSONResponse) or not r.get("ok"):
@@ -282,12 +282,12 @@ def register(app, deps: ChannelsDeps):
         if isinstance(brain, str):
             patch["brain"] = brain.strip()
         if cur and cur.get("channel") == "zernio":
-            from zernio_bot import split_credentials
+            from zernio_bot import split_credentials, storable_credentials
             credentials = split_credentials(token.strip() or channel_accounts.get_token(account_id))
             if not credentials["api_key"]:
                 return _400(localefmt.chu("Thiếu API key hoặc kết nối Zernio không hợp lệ",
                                          "Missing API key or invalid Zernio connection"), code="missing_api_key")
-            token = json.dumps(credentials)
+            token = json.dumps(storable_credentials(credentials))
             result = await verify_token("zernio", token, account_id=account_id)
             if isinstance(result, JSONResponse):
                 return result

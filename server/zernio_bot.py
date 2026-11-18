@@ -81,18 +81,27 @@ def _now() -> float:
 # Credentials & Helper Functions
 # ============================================================
 def split_credentials(token: Any) -> dict:
-    """Extracts credentials from string or dict: account_id, username, secret, api_key."""
+    """Credentials of one channel account: account_id, username, secret, api_key, connection_id.
+
+    With a connection_id the API key and (unless the account has its own) the webhook secret come from
+    that connection, so rotating either one there reaches every account that uses it.
+    """
     if isinstance(token, dict):
         d = dict(token)
         aid = str(d.get("account_id") or d.get("accountId") or d.get("id") or "").strip()
         uname = str(d.get("username") or "").strip()
         sec = str(d.get("secret") or d.get("webhook_secret") or "").strip()
         key = str(d.get("api_key") or d.get("apiKey") or "").strip()
-        return {"account_id": aid, "username": uname, "secret": sec, "api_key": key or (connection_api_key(str(d["connection_id"])) if d.get("connection_id") else _fallback_api_key())}
+        cid = str(d.get("connection_id") or "").strip()
+        if cid:
+            key = connection_api_key(cid) or key
+            sec = sec or connection_webhook_secret(cid)
+        return {"account_id": aid, "username": uname, "secret": sec,
+                "api_key": key or (_fallback_api_key() if not cid else ""), "connection_id": cid}
 
     raw = str(token or "").strip()
     if not raw:
-        return {"account_id": "", "username": "", "secret": "", "api_key": _fallback_api_key()}
+        return {"account_id": "", "username": "", "secret": "", "api_key": _fallback_api_key(), "connection_id": ""}
 
     if raw.startswith("{") and raw.endswith("}"):
         try:
@@ -107,7 +116,19 @@ def split_credentials(token: Any) -> dict:
     uname = parts[1] if len(parts) > 1 else ""
     sec = parts[2] if len(parts) > 2 else ""
     key = parts[3] if len(parts) > 3 else ""
-    return {"account_id": aid, "username": uname, "secret": sec, "api_key": key or _fallback_api_key()}
+    return {"account_id": aid, "username": uname, "secret": sec, "api_key": key or _fallback_api_key(),
+            "connection_id": ""}
+
+
+def storable_credentials(creds: dict) -> dict:
+    """What to save for an account. Behind a connection the key and its secret stay there, not copied."""
+    out = dict(creds)
+    cid = str(out.get("connection_id") or "")
+    if cid:
+        out.pop("api_key", None)
+        if out.get("secret") and out["secret"] == connection_webhook_secret(cid):
+            out.pop("secret", None)
+    return out
 
 
 def available_connections() -> List[dict]:
@@ -128,6 +149,14 @@ def connection_api_key(connection_id: str = "") -> str:
     if len(matches) != 1:
         return ""
     return str((mcp_store.connection_secrets(matches[0]["id"]) or {}).get("api_key") or "").strip()
+
+
+def connection_webhook_secret(connection_id: str) -> str:
+    """The webhook secret kept in a connection (one per Zernio account), or empty."""
+    import mcp_store
+    if connection_id not in {c["id"] for c in available_connections()}:
+        return ""
+    return str((mcp_store.connection_secrets(connection_id) or {}).get("webhook_secret") or "").strip()
 
 
 def _fallback_api_key() -> str:
@@ -480,7 +509,8 @@ async def send_api_delivery(creds: dict, conversation_id: str, text: str, idempo
         return {"kind": "blocked", "code": "missing conversation_id or text", "retry_after_seconds": None}
 
     aid = creds.get("account_id") or ""
-    api_key = creds.get("api_key") or _fallback_api_key()
+    cid = str(creds.get("connection_id") or "")
+    api_key = (connection_api_key(cid) if cid else "") or creds.get("api_key") or (_fallback_api_key() if not cid else "")
     if not api_key:
         return {"kind": "blocked", "code": "missing_api_key", "retry_after_seconds": None}
 
@@ -494,9 +524,22 @@ async def send_api_delivery(creds: dict, conversation_id: str, text: str, idempo
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(url, json=payload, headers=headers)
-            return classify_delivery(resp.status_code, getattr(resp, "headers", {}).get("Retry-After"), _now())
+            result = classify_delivery(resp.status_code, getattr(resp, "headers", {}).get("Retry-After"), _now())
+            if result["kind"] == "accepted":
+                result["message_id"] = _response_message_id(resp)
+            return result
     except Exception:
         return classify_delivery(None, None, _now())
+
+
+def _response_message_id(resp) -> str:
+    """The id Zernio gives the message just sent (`data.messageId`); empty when the body has none."""
+    try:
+        body = resp.json()
+        data = body.get("data") if isinstance(body, dict) else None
+        return str((data or {}).get("messageId") or "").strip() if isinstance(data, dict) else ""
+    except Exception:
+        return ""
 
 
 async def send_text_for_account(tk: dict, chat_id: str, text: str) -> Tuple[bool, str]:
@@ -536,7 +579,23 @@ def _saved_account(provider_id: str) -> Optional[dict]:
 def _known_secrets() -> List[str]:
     found = [str(cr.get("secret") or "") for cr in _ACCOUNTS.values()]
     found += [a["secret"] for a in _saved_accounts()]
+    try:
+        found += [connection_webhook_secret(c["id"]) for c in available_connections()]
+    except Exception as e:  # noqa: BLE001
+        print(f"[zernio known secrets] {type(e).__name__}: {e}", file=sys.stderr)
     return list(dict.fromkeys(s for s in found if s))
+
+
+def _live_secrets(bot) -> List[str]:
+    """The secret the bot started with plus the connection's current one, so a rotation applies at once."""
+    found = [bot.secret]
+    cid = str(bot.creds.get("connection_id") or "")
+    if cid:
+        try:
+            found.append(connection_webhook_secret(cid))
+        except Exception:  # noqa: BLE001
+            pass
+    return [x for x in dict.fromkeys(found) if x]
 
 
 def _note_username_change(bot, acc_obj) -> None:
@@ -601,7 +660,7 @@ def _receive_webhook(raw, headers, state):
         if bot and bot._stop:
             bot = None
         if bot:
-            if not verify_signature(raw, sig, bot.secret):
+            if not any(verify_signature(raw, sig, sec) for sec in _live_secrets(bot)):
                 return 401, {"ok": False, "error": "invalid_signature"}
         else:
             saved = _saved_account(account_id)
@@ -770,14 +829,25 @@ def _conversation_state(state, bot, conversation_id):
     return key, current
 
 
-def _is_bot_echo(current, text, now) -> bool:
-    """True (and forgets the entry) when an outgoing message is one of the bot's own replies."""
-    echo = _norm_text(text)
+def _is_bot_echo(current, msg, now) -> bool:
+    """True (and forgets the entry) when an outgoing message is one of the bot's own replies.
+
+    A reply whose id Zernio gave back is matched by that id only, so staff typing the same words is
+    still staff. Text is the fallback for a reply still in flight or whose response carried no id.
+    """
     sent = [e for e in current.get("bot_sent", []) if now - float(e.get("ts") or 0) < BOT_ECHO_WINDOW]
     current["bot_sent"] = sent
+    ids = {str(msg.get("id") or "").strip(), str(msg.get("platformMessageId") or "").strip()} - {""}
+    for i, entry in enumerate(sent):
+        if entry.get("id") and entry["id"] in ids:
+            sent.pop(i)
+            return True
+    echo = _norm_text(msg.get("text"))
     if not echo:
         return False
     for i, entry in enumerate(sent):
+        if entry.get("id"):
+            continue
         mine = entry.get("t") or ""
         # Equal, or one part of a long reply Instagram split in several messages.
         if echo == mine or (len(echo) >= 20 and echo in mine):
@@ -817,7 +887,7 @@ def _receive_sent(state, bot, body, msg, account_id, now, mark_event_handled):
         return mark_event_handled(200, "duplicate_message")
     state["messages"][out_key] = {"ts": now}
     _key, current = _conversation_state(state, bot, conv_id)
-    if _is_bot_echo(current, msg.get("text"), now):
+    if _is_bot_echo(current, msg, now):
         return mark_event_handled(202, "bot_echo")
     sent_via = msg.get("sentVia")
     sent_via = str(sent_via).strip().lower() if sent_via else ""
@@ -1047,12 +1117,14 @@ def _handoff(current, manual=False):
     current["auto_handoff"] = True
 
 
-_FAIL_REASONS = {
-    "provider_http_401": "Zernio từ chối quyền",
-    "provider_http_403": "Zernio từ chối quyền",
-    "provider_http_429": "Zernio giới hạn tốc độ",
-    "idempotency_window_expired": "quá 23 giờ chưa gửi được",
-}
+def _fail_reason(reason) -> str:
+    if reason in ("provider_http_401", "provider_http_403"):
+        return localefmt.chu("Zernio từ chối quyền", "Zernio refused access")
+    if reason == "provider_http_429":
+        return localefmt.chu("Zernio giới hạn tốc độ", "Zernio rate limit")
+    if reason == "idempotency_window_expired":
+        return localefmt.chu("quá 23 giờ chưa gửi được", "not sent after 23 hours")
+    return localefmt.chu("lỗi gửi", "send error")
 
 
 def _platform_label(current) -> str:
@@ -1065,10 +1137,13 @@ def _ring_failure(bot, current, reason):
     batch = current.get("processing") or []
     sender = (batch[-1].get("sender") or {}) if batch else {}
     name = str(sender.get("name") or sender.get("username") or current.get("conversation_id") or "")
-    why = _FAIL_REASONS.get(reason, "lỗi gửi")
-    inbox.add(f"Bot không gửi được câu trả lời cho khách {name} trên kênh {_platform_label(current)} ({why}). "
-              "Nhân viên kiểm tra hội thoại giúp.",
-              kind="system", channel="zernio", title="Zernio: chưa gửi được tin cho khách",
+    why = _fail_reason(reason)
+    platform = _platform_label(current)
+    inbox.add(localefmt.chu(
+        f"Bot không gửi được câu trả lời cho khách {name} trên kênh {platform} ({why}). Nhân viên kiểm tra hội thoại giúp.",
+        f"The bot could not send its reply to customer {name} on {platform} ({why}). Staff, please check the conversation."),
+              kind="system", channel="zernio",
+              title=localefmt.chu("Zernio: chưa gửi được tin cho khách", "Zernio: reply not delivered"),
               dedup="zernio-fail:" + str(current.get("send_key") or ""))
 
 
@@ -1212,7 +1287,7 @@ async def _flush_locked(key):
                     # Remember the text before HTTP so its `message.sent` echo is not taken for staff.
                     current["bot_sent"] = [e for e in current.get("bot_sent", [])
                                            if _now() - float(e.get("ts") or 0) < BOT_ECHO_WINDOW][-19:]
-                    if not any(e.get("t") == _norm_text(reply) for e in current["bot_sent"]):
+                    if not any(e.get("t") == _norm_text(reply) and not e.get("id") for e in current["bot_sent"]):
                         current["bot_sent"].append({"t": _norm_text(reply), "ts": _now()})
                     # Persist a retry guard before HTTP too, including crash during send.
                     current["next_retry_at"] = min(
@@ -1242,6 +1317,14 @@ async def _flush_locked(key):
                 else:
                     _arm_timer(key, next_retry - _now())
                 return
+            sent_id = str(result.get("message_id") or "")
+            if sent_id:
+                with _state_store.transaction() as state:
+                    done = state["conversations"].get(key) or {}
+                    for entry in done.get("bot_sent", []):
+                        if entry.get("t") == _norm_text(reply) and not entry.get("id"):
+                            entry["id"] = sent_id
+                            break
             receipt = conversations.ghi_su_kien({
                 "channel": "zernio", "account_id": bot.account_id, "bot_id": str(bot.bot_id),
                 "account_name": bot.bot_username, "external_chat_id": conversation_id,
