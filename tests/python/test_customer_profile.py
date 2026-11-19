@@ -279,7 +279,18 @@ check("the retry starts from what the owner wrote", run(cp.update(c2)) == "updat
 # A chat the bot never answered in (a friend on a watched personal account) is nobody's customer.
 record("c3", "customer", "Tối nay đi ăn không?")
 n = len(asked)
-check("a chat no bot answered in gets no profile", run(cp.update(conv_id("c3"))) == "skipped:no_bot_answer" and len(asked) == n)
+check("a chat nobody from the shop answered in gets no profile", run(cp.update(conv_id("c3"))) == "skipped:no_shop_answer" and len(asked) == n)
+
+# A chat only staff answered (the bot is not live yet) gets a profile, so it is ready on the bot's first day.
+record("c3s", "customer", "Son màu đỏ gạch còn không shop, giao về 12 Lê Lợi nha")
+record("c3s", "human", "Dạ còn ạ, em lên đơn cho chị nhé")
+c3s = conv_id("c3s")
+check("a chat only staff answered in is a candidate", c3s in [c["conversation_id"] for c in conversations.profile_candidates(0)])
+answers[:] = ["Địa chỉ: 12 Lê Lợi\nQuan tâm: son màu đỏ gạch"]
+check("a chat only staff answered in gets a profile", run(cp.update(c3s)) == "updated"
+      and "Người bên mình: Dạ còn ạ" in asked[-1] and "SĐT:" in asked[-1] and "Đã chốt:" in asked[-1]
+      and "12 Lê Lợi" in conversations.profile_of_chat("zalo", "acc1", "c3s"))
+n = len(asked)
 check("a group gets no profile", run(cp.update(conv_id("g1"))) == "skipped:not_private" and len(asked) == n)
 check("a comment thread gets no profile, whichever platform", len(asked) == n and all(
     run(cp.update(conv_id(chat, channel))) == "skipped:not_private"
@@ -302,7 +313,7 @@ cp._failed_at.clear()
 due = cp.due(NOW)
 check("a quiet chat with unread messages is due", c4 in due, due)
 check("a chat with nothing new is not", c2 not in due and c1 not in due, due)
-check("a chat no bot answered in is not even a candidate", conv_id("c3") not in due)
+check("a chat nobody from the shop answered in is not even a candidate", conv_id("c3") not in due)
 check("a group is never due", conv_id("g1") not in due and conv_id("g2") not in due)
 check("a comment thread is never due", not {conv_id("cmt:900", "messenger"), conv_id("igc:901", "messenger"),
                                            conv_id("thread902", "threads")} & set(due), due)

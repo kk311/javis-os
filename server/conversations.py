@@ -2157,8 +2157,8 @@ def profile_of_chat(channel: str, account_id: str, external_chat_id: str) -> str
 def profile_read(conversation_id: int) -> Optional[dict]:
     """What the profile writer needs to know about one conversation, None when it is not a private chat with a known
     customer (a group and a comment thread are not): `{conversation_id, customer_id, bot_id, name, note, upto, last_id, has_ai}`. `upto` is the row id of the
-    last message already read into the profile (0 = never), `last_id` the newest message, `has_ai` whether a bot has
-    ever answered in this chat."""
+    last message already read into the profile (0 = never), `last_id` the newest message, `has_ai` whether the shop (its bot,
+    or staff replying in the inbox or the platform's own app) has ever answered in this chat."""
     with _lock:
         db = _conn()
         r = db.execute(
@@ -2168,7 +2168,7 @@ def profile_read(conversation_id: int) -> Optional[dict]:
         if r is None:
             return None
         last = db.execute("SELECT MAX(id) FROM messages WHERE conversation_id=?", (int(conversation_id),)).fetchone()[0]
-        ai = db.execute("SELECT 1 FROM messages WHERE conversation_id=? AND sender_type='ai' LIMIT 1",
+        ai = db.execute("SELECT 1 FROM messages WHERE conversation_id=? AND sender_type IN ('ai','human') LIMIT 1",
                         (int(conversation_id),)).fetchone()
     mark = _profile_mark(_loads(r["metadata_json"], {}))
     return {"conversation_id": int(r["id"]), "customer_id": int(r["customer_id"]), "bot_id": str(r["bot_id"] or ""),
@@ -2177,9 +2177,11 @@ def profile_read(conversation_id: int) -> Optional[dict]:
 
 
 def profile_candidates(since: float, limit: int = 5000) -> List[dict]:
-    """Private chats (no group, no comment thread) a bot has answered in, active since `since`, that hold messages the profile has not read yet,
-    least recently active first: `[{conversation_id, bot_id, last_message_at, upto, last_id}]`. A chat where no bot
-    ever spoke is left out here already: a watched personal account holds hundreds of them (family, friends)."""
+    """Private chats (no group, no comment thread) of a bot's account that the shop (the bot or staff) has answered in, active since `since`, that hold messages the profile has not read yet,
+    least recently active first: `[{conversation_id, bot_id, last_message_at, upto, last_id}]`. A chat with no bot is
+    left out here already: a watched personal account holds hundreds of them (family, friends). Staff answers count
+    since 19/11/2026 (the owner): a shop's staff answer for weeks before its bot goes live, and the profile should
+    be there on the bot's first day."""
     n = max(1, min(int(limit or 5000), 20000))
     with _lock:
         rows = _conn().execute(
@@ -2187,7 +2189,7 @@ def profile_candidates(since: float, limit: int = 5000) -> List[dict]:
             " (SELECT MAX(m.id) FROM messages m WHERE m.conversation_id=c.id) AS last_id"
             f" FROM conversations c WHERE {_PROFILE_CHAT_SQL} AND c.bot_id != '' AND c.customer_id IS NOT NULL"
             " AND c.last_message_at >= ?"
-            " AND EXISTS(SELECT 1 FROM messages a WHERE a.conversation_id=c.id AND a.sender_type='ai')"
+            " AND EXISTS(SELECT 1 FROM messages a WHERE a.conversation_id=c.id AND a.sender_type IN ('ai','human'))"
             " ORDER BY c.last_message_at ASC LIMIT ?", (float(since or 0), n)).fetchall()
     out = []
     for r in rows:
