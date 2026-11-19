@@ -37,18 +37,27 @@ Ba LOẠI kênh (`kind`), khác nhau ở cách có tài khoản chứ không ở
 Thêm một kênh = thêm một file ở đây + một dòng trong `_MODULES` + một logo trong icons.js.
 Không sửa gì khác.
 
+Channels from a Store pack: a pack lists `provides.channels: [channels/<name>.py]` in its manifest. The module
+follows the same contract as a core channel and may carry its own logo in `SPEC.logo_svg` (the inner SVG of a
+24x24 viewBox, filtered to a safe whitelist), so neither `_MODULES` nor icons.js changes. A pack channel loads
+after the core ones, only from an ENABLED pack whose code passed the install gate (`packs.cho_chay_ma`), and
+never replaces a channel id that already exists: on any problem it is MISSING, never half-loaded.
+
 Optional module attributes (0.459.0, internal API channel):
     GENERATED_KEY = True          the account secret is a key Javis generates on Save and shows once (no pasted token);
                                   the module provides `new_key()`, `key_meta(raw)`, `default_settings()`
     PERMISSION_CEILING = "<level>"  the highest Chatbot permission level a turn on this channel may run at;
                                   `chatbot_runtime` refuses a turn above it
     clean_settings(data), account_settings_spec()   numeric account settings edited on the account form
+    TOKEN_FORM = {...}            the account form as declared fields instead of one token box (see `_token_form`)
     MAX_ACCOUNTS_PER_BOT = <n>    how many accounts of this channel one bot may serve (default 20, see
                                   `max_accounts_per_bot`)
 """
 from __future__ import annotations
 
 import importlib
+import importlib.util
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -83,6 +92,10 @@ class KenhSpec:
     # Bản tiếng Anh của chữ hiện ra (`nhan`, `lay_token`, `tom_tat`). Thiếu thì lấy ở
     # `_EN_MAC_DINH` theo id, rồi mới tới bản tiếng Việt.
     en: Dict[str, str] = field(default_factory=dict)
+    # Logo of a channel that icons.js does not know (pack channels): inner SVG of a 24x24 viewBox.
+    logo_svg: str = ""
+    # Id of the Store pack that added this channel ("" for core channels).
+    pack: str = ""
 
     def nl(self, khoa: str) -> bool:
         return bool(self.nang_luc.get(khoa, NANG_LUC_MAC_DINH.get(khoa, False)))
@@ -113,17 +126,22 @@ _EN_MAC_DINH: Dict[str, Dict[str, str]] = {
 }
 
 _DS: Optional[Dict[str, KenhSpec]] = None
+_DS_SIG: Optional[str] = None
 _MOD: Dict[str, object] = {}
 
 
 def _nap() -> Dict[str, KenhSpec]:
-    global _DS
-    if _DS is not None:
+    global _DS, _DS_SIG
+    sig = _goi_sig()
+    if _DS is not None and _DS_SIG == sig:
         return _DS
+    _DS_SIG = sig
     ds: Dict[str, KenhSpec] = {}
-    for ten in _MODULES:
+    mods: dict = {}
+    nguon = [(ten, "") for ten in _MODULES] + _kenh_cua_goi()
+    for ten, pid in nguon:
         try:
-            m = importlib.import_module(ten)
+            m = _nap_module_goi(ten, pid) if pid else importlib.import_module(ten)
         except Exception as e:      # một kênh hỏng KHÔNG được kéo cả sổ chết
             print(f"[channels] không nạp được {ten}: {type(e).__name__}: {e}", file=sys.stderr)
             continue
@@ -131,6 +149,12 @@ def _nap() -> Dict[str, KenhSpec]:
         if not isinstance(spec, KenhSpec) or spec.kind not in KIND or not spec.id:
             print(f"[channels] {ten} không có SPEC hợp lệ, bỏ qua", file=sys.stderr)
             continue
+        if pid:
+            if spec.id in ds:
+                print(f"[channels] gói {pid}: kênh '{spec.id}' trùng kênh đã có, bỏ qua", file=sys.stderr)
+                continue
+            spec.pack = pid
+            spec.logo_svg = _svg_sach(spec.logo_svg)
         nl = dict(NANG_LUC_MAC_DINH)
         nl.update(spec.nang_luc or {})
         # Hai năng lực suy ra từ chính module, không tin lời khai: có hàm mới có năng lực.
@@ -146,9 +170,96 @@ def _nap() -> Dict[str, KenhSpec]:
         if not spec.logo:
             spec.logo = spec.id
         ds[spec.id] = spec
-        _MOD[spec.id] = m
+        mods[spec.id] = m
+    # Swap both at once: a channel of a pack that was just removed must not linger in _MOD.
+    _MOD.clear()
+    _MOD.update(mods)
     _DS = ds
     return ds
+
+
+def _goi_sig() -> str:
+    try:
+        import packs
+        return str(packs.signature())
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _kenh_cua_goi() -> list:
+    """[(file path, pack id)] of pack channels allowed to run. Never raises."""
+    try:
+        import packs
+        ra = []
+        for pid, path in packs.channel_files():
+            ok, vi_sao = packs.cho_chay_ma(pid)
+            if not ok:
+                print(f"[channels] gói {pid}: không nạp kênh {path.name}: {vi_sao}", file=sys.stderr)
+                continue
+            ra.append((str(path), pid))
+        return ra
+    except Exception as e:  # noqa: BLE001
+        print(f"[channels] không đọc được kênh của gói: {type(e).__name__}: {e}", file=sys.stderr)
+        return []
+
+
+def _nap_module_goi(path: str, pid: str):
+    """Import one pack channel file as `channels._pack_<pack>_<name>` (stable name, so a reload replaces it)."""
+    from pathlib import Path
+    ten = "channels._pack_" + re.sub(r"[^a-z0-9_]", "_", pid) + "_" + Path(path).stem
+    spec = importlib.util.spec_from_file_location(ten, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(path)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules[ten] = m
+    try:
+        spec.loader.exec_module(m)
+    except BaseException:
+        sys.modules.pop(ten, None)
+        raise
+    return m
+
+
+def nap_lai() -> None:
+    """Forget the registry so the next read rebuilds it (a pack was installed, removed, switched)."""
+    global _DS, _DS_SIG
+    _DS, _DS_SIG = None, None
+    _MOD.clear()
+
+
+# Whitelist for `SPEC.logo_svg`. The logo is put into the page as markup, so anything outside plain drawing
+# (script, foreignObject, event handlers, links, external references, style) is refused, and the WHOLE logo is
+# dropped rather than repaired: a pack channel without a logo still reads fine next to its name.
+_SVG_THE = {"g", "path", "rect", "circle", "ellipse", "line", "polyline", "polygon", "defs",
+            "lineargradient", "radialgradient", "stop", "title"}
+_SVG_THUOC_TINH = {"d", "x", "y", "x1", "y1", "x2", "y2", "cx", "cy", "r", "rx", "ry", "width", "height",
+                   "points", "fill", "fill-rule", "clip-rule", "fill-opacity", "stroke", "stroke-width",
+                   "stroke-linecap", "stroke-linejoin", "stroke-opacity", "opacity", "transform", "id",
+                   "offset", "stop-color", "stop-opacity", "gradientunits", "gradienttransform"}
+_SVG_GIA_TRI_XAU = re.compile(r"url\(\s*(?!#)|javascript:|data:|expression|[<>]", re.I)
+
+
+def _svg_sach(svg: str) -> str:
+    svg = str(svg or "").strip()
+    if not svg or len(svg) > 8000:
+        return ""
+    import xml.etree.ElementTree as ET
+    try:
+        goc = ET.fromstring('<svg xmlns="http://www.w3.org/2000/svg">' + svg + "</svg>")
+    except ET.ParseError:
+        return ""
+    for el in goc.iter():
+        if el is goc:
+            continue
+        the = el.tag.split("}")[-1].lower()
+        if the not in _SVG_THE:
+            return ""
+        for k, v in el.attrib.items():
+            k = k.split("}")[-1].lower()
+            if k not in _SVG_THUOC_TINH or _SVG_GIA_TRI_XAU.search(str(v)):
+                return ""
+    ET.register_namespace("", "http://www.w3.org/2000/svg")
+    return "".join(ET.tostring(c, encoding="unicode") for c in goc).replace(' xmlns="http://www.w3.org/2000/svg"', "")
 
 
 def danh_sach() -> List[KenhSpec]:
@@ -232,6 +343,8 @@ def cho_giao_dien() -> List[dict]:
     for s in danh_sach():
         out.append({
             "id": s.id, "nhan": _chu_spec(s, "nhan"), "kind": s.kind, "logo": s.logo, "mau": s.mau,
+            # Pack channels draw their own logo (icons.js does not know them), see `Icons.napKenh`.
+            "logo_svg": s.logo_svg, "pack": s.pack,
             "lay_token": _chu_spec(s, "lay_token"), "tom_tat": _chu_spec(s, "tom_tat"),
             "tien_to_ten": s.tien_to_ten,
             "nang_luc": dict(s.nang_luc),
@@ -251,8 +364,88 @@ def cho_giao_dien() -> List[dict]:
             "khoa_tu_sinh": bool(getattr(_MOD.get(s.id), "GENERATED_KEY", False)),
             "tran_muc_quyen": str(getattr(_MOD.get(s.id), "PERMISSION_CEILING", "") or ""),
             "cai_dat_tk": _account_settings(_MOD.get(s.id)),
+            # Declarative credential form (pack channels): fields the dashboard draws instead of one token box.
+            "form_tk": _token_form(_MOD.get(s.id)),
         })
     return out
+
+
+# `TOKEN_FORM` (optional module attribute): the account form as DATA, so a channel with a structured credential
+# (several ids, a connection to pick, accounts to list) needs no code in conversations.js and a pack ships no
+# dashboard JS. The dashboard joins the sent fields into one JSON object and posts it as the token; the module's
+# `prepare_token` / `verify_token` read it as usual. Anything outside this shape is dropped here, field by field:
+#
+#   {"fields": [{"key": "account_id", "type": "text" | "password" | "select", "label": str | {"vi","en"},
+#                "hint": ..., "required": bool, "required_unless": "<other key>", "hidden_when": "<other key>",
+#                "send": bool (default True), "initial": "external_id" | "meta.<key>",
+#                "options": {"url": "/ext/<slug>/<path>", "list": "<array key>", "value": "<item key>",
+#                            "label": "@{username} ({platform})", "empty": label, "from": ["<keys>"],
+#                            "fill": {"<field key>": "<item key>"}, "button": label, "auto_single": bool}}],
+#    "webhook_params": {"<query param>": "<field key>"}}
+#
+# A select with `options.from` POSTs those fields as a form body (a typed key never lands in a URL); without it,
+# a GET. Option URLs must stay under /ext/ (plugin routes), so a declared form can never call a core route.
+_FORM_KHOA = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+_FORM_URL = re.compile(r"^/ext/[a-z0-9][a-z0-9._-]{0,63}(/[A-Za-z0-9._-]+){1,4}$")
+_FORM_KIEU = ("text", "password", "select")
+
+
+def _form_chu(v, toi_da: int = 300) -> str:
+    import localefmt
+    if isinstance(v, dict):
+        vi, en = str(v.get("vi") or ""), str(v.get("en") or "")
+        v = localefmt.chu(vi or en, en or vi) if (vi or en) else ""
+    return str(v or "")[:toi_da] if isinstance(v, str) else ""
+
+
+def _form_khoa(v) -> str:
+    v = str(v or "")
+    return v if _FORM_KHOA.match(v) else ""
+
+
+def _token_form(m) -> dict:
+    tf = getattr(m, "TOKEN_FORM", None)
+    if not isinstance(tf, dict) or not isinstance(tf.get("fields"), list):
+        return {}
+    try:
+        fields = []
+        for f in tf["fields"][:12]:
+            if not isinstance(f, dict) or not _form_khoa(f.get("key")) or f.get("type") not in _FORM_KIEU:
+                continue
+            o = {"key": f["key"], "type": f["type"], "label": _form_chu(f.get("label"), 120) or f["key"],
+                 "hint": _form_chu(f.get("hint")), "required": bool(f.get("required")),
+                 "send": f.get("send", True) is not False}
+            for k in ("required_unless", "hidden_when"):
+                if _form_khoa(f.get(k)):
+                    o[k] = f[k]
+            ini = str(f.get("initial") or "")
+            if ini == "external_id" or (ini.startswith("meta.") and _form_khoa(ini[5:])):
+                o["initial"] = ini
+            if f["type"] == "select":
+                op = f.get("options") if isinstance(f.get("options"), dict) else {}
+                url = str(op.get("url") or "")
+                if not _FORM_URL.match(url) or any(p in (".", "..") for p in url.split("/")):
+                    continue
+                o["options"] = {
+                    "url": url, "list": _form_khoa(op.get("list")) or "items",
+                    "value": _form_khoa(op.get("value")) or "id",
+                    "label": str(op.get("label") or "{" + (_form_khoa(op.get("value")) or "id") + "}")[:80],
+                    "empty": _form_chu(op.get("empty"), 120),
+                    "from": [k for k in (op.get("from") or []) if _form_khoa(k)][:4],
+                    "fill": {k: v for k, v in (op.get("fill") or {}).items() if _form_khoa(k) and _form_khoa(v)},
+                    "button": _form_chu(op.get("button"), 60),
+                    "auto_single": bool(op.get("auto_single")),
+                }
+            fields.append(o)
+        if not fields:
+            return {}
+        keys = {f["key"] for f in fields}
+        wp = tf.get("webhook_params") if isinstance(tf.get("webhook_params"), dict) else {}
+        return {"fields": fields,
+                "webhook_params": {k: v for k, v in wp.items() if _form_khoa(k) and v in keys}}
+    except Exception as e:  # noqa: BLE001 - a broken form must not take the channel list down
+        print(f"[channels] token form of {getattr(m, '__name__', m)}: {type(e).__name__}: {e}", file=sys.stderr)
+        return {}
 
 
 def _account_settings(m) -> List[dict]:

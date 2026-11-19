@@ -335,6 +335,7 @@
                         (_tkMoiBrain ? "&tat_ca=1" : ""));
       _tk = d.accounts || [];
       if (d.channels) _kenhDS = d.channels;
+      if (window.Icons && Icons.napKenh) Icons.napKenh(_kenhDS);
       var vet = JSON.stringify(_tk);
       if (im && vet === _dauVetTK) return false;
       _dauVetTK = vet;
@@ -720,6 +721,7 @@
       if (d.who_counts) _whoCounts = d.who_counts;
       if (d.tags) _tags = d.tags;
       if (d.channels) _kenhDS = d.channels;
+      if (window.Icons && Icons.napKenh) Icons.napKenh(_kenhDS);
       var vet = JSON.stringify([_items, _stats, _facets, _botList, _conDS, _tags, _whoCounts]);
       if (im && vet === _dauVet) return;
       _dauVet = vet;
@@ -2705,6 +2707,143 @@
   //
   // `opts.onXong(account)`: gọi khi tài khoản đã tạo xong, để nơi gọi tự làm tiếp (form bot
   // tích sẵn tài khoản vừa nối). Không truyền thì chỉ nạp lại tab Tài khoản bot như cũ.
+  // Declared account form (`TOKEN_FORM` of a channel module, served as `k.form_tk`): fields drawn from data, so a
+  // channel with a structured credential (a connection to pick, an account picked from a list, a secret)
+  // needs no code here. The sent fields are joined into ONE JSON object posted as the token. Option lists come only
+  // from /ext/ routes (the server refuses any other URL); a select that depends on other fields POSTs them as a form
+  // body, so a typed key never lands in a URL. `account` set = edit: an untouched form sends no token (no change).
+  function veFormTK(host, form, account, onChange) {
+    var dirty = false, gen = {}, self = {};
+    host._formTK = self;
+    var md = (account && account.meta) || {};
+    function dau(f) {
+      if (!account || !f.initial) return "";
+      if (f.initial === "external_id") return account.external_id || "";
+      var v = md[f.initial.slice(5)];
+      return v == null ? "" : String(v);
+    }
+    host.innerHTML = form.fields.map(function (f) {
+      var id = "htF_" + f.key;
+      var o = '<div class="ht-ftk" data-k="' + esc(f.key) + '"><label for="' + id + '">' + esc(f.label) +
+        (f.hint ? ' ' + infoBtn() : "") + '</label>' + (f.hint ? infoBody(esc(f.hint)) : "");
+      if (f.type === "select") {
+        o += '<div class="cb-row"><select id="' + id + '"></select>' + (f.options.from.length
+          ? '<button type="button" class="s-btn-ghost" data-load="' + esc(f.key) + '">' +
+            esc(f.options.button || window.t("ht.form_tai")) + '</button>' : "") + '</div>' +
+          '<div class="cb-hint" data-st="' + esc(f.key) + '" role="status"></div>';
+      } else {
+        o += '<input id="' + id + '" type="' + (f.type === "password" ? "password" : "text") +
+          '" autocomplete="off" value="' + esc(dau(f)) + '">';
+      }
+      return o + '</div>';
+    }).join("");
+    function o(k) { return host.querySelector("#htF_" + k); }
+    function val(k) { var n = o(k); return n ? String(n.value || "").trim() : ""; }
+    function fieldOf(k) { return form.fields.filter(function (f) { return f.key === k; })[0]; }
+    function status(k, m) { var n = host.querySelector('[data-st="' + k + '"]'); if (n) n.textContent = m || ""; }
+    function an() {
+      form.fields.forEach(function (f) {
+        if (!f.hidden_when) return;
+        var w = host.querySelector('.ht-ftk[data-k="' + f.key + '"]');
+        var hide = !!val(f.hidden_when);
+        if (w) w.hidden = hide;
+        if (hide && o(f.key)) o(f.key).value = "";
+      });
+    }
+    function rong(f) { return '<option value="">' + esc(f.options.empty || window.t("ht.form_chon")) + '</option>'; }
+    function nhan(tpl, item) {
+      return String(tpl).replace(/\{([a-z0-9_]+)\}/g, function (_, k) { return item[k] == null ? "" : String(item[k]); });
+    }
+    async function tai(f, tuDong) {
+      var my = gen[f.key] = (gen[f.key] || 0) + 1;
+      var sel = o(f.key), op = f.options;
+      var body = {}, co = false;
+      op.from.forEach(function (k) { var v = val(k); if (v) { body[k] = v; co = true; } });
+      if (op.from.length && !co) { sel.innerHTML = rong(f); status(f.key, ""); return; }
+      status(f.key, window.t("ht.form_dang_tai"));
+      try {
+        var r = op.from.length ? await api(op.url, { method: "POST", body: fd(body) }) : await api(op.url);
+        if (my !== gen[f.key] || host._formTK !== self) return;
+        var ds = Array.isArray(r[op.list]) ? r[op.list] : [];
+        sel._items = ds;
+        sel.innerHTML = rong(f) + ds.map(function (it, i) {
+          return '<option value="' + esc(it[op.value]) + '" data-i="' + i + '">' + esc(nhan(op.label, it)) + '</option>';
+        }).join("");
+        status(f.key, ds.length ? "" : window.t("ht.form_trong"));
+        // Edit form: the saved value (`initial`), once, if the list still has it.
+        var d0 = dau(f);
+        if (d0 && !sel._daDat && ds.some(function (it) { return String(it[op.value]) === d0; })) {
+          sel._daDat = true;
+          sel.value = d0;
+          sel.selectedIndex = Array.prototype.map.call(sel.options, function (x) { return x.value; }).indexOf(d0);
+          an();
+          doi(f.key);
+        } else if (op.auto_single && ds.length === 1 && !account && !dirty) {
+          sel.value = String(ds[0][op.value]);
+          chon(f);
+        }
+      } catch (e) { if (my === gen[f.key] && host._formTK === self) status(f.key, e.message); }
+      if (!tuDong) dirty = true;
+    }
+    function chon(f) {
+      var sel = o(f.key), opt = sel.options[sel.selectedIndex];
+      var it = opt && opt.dataset.i != null && sel._items ? sel._items[Number(opt.dataset.i)] : null;
+      if (it) Object.keys(f.options.fill).forEach(function (k) {
+        var n = o(k); if (n && it[f.options.fill[k]] != null) n.value = String(it[f.options.fill[k]]);
+      });
+      an();
+      doi(f.key);
+    }
+    // A field changed: reload the selects that depend on a SELECT (typed fields reload with their button).
+    function doi(k) {
+      var f0 = fieldOf(k);
+      form.fields.forEach(function (f) {
+        if (f.type !== "select" || f.options.from.indexOf(k) < 0) return;
+        if (f0 && f0.type === "select") tai(f, true);
+        else { gen[f.key] = (gen[f.key] || 0) + 1; o(f.key).innerHTML = rong(f); }
+      });
+      if (onChange) { try { onChange(k); } catch (e) {} }
+    }
+    form.fields.forEach(function (f) {
+      var n = o(f.key);
+      if (f.type === "select") {
+        n.innerHTML = rong(f);
+        n.onchange = function () { dirty = true; chon(f); };
+        var b = host.querySelector('[data-load="' + f.key + '"]');
+        if (b) b.onclick = function () { tai(f, false); };
+        if (!f.options.from.length) tai(f, true);
+      } else {
+        n.oninput = function () { dirty = true; an(); doi(f.key); };
+      }
+    });
+    an();
+    self.value = val;
+    // The token to post: "" for an untouched edit, otherwise the JSON of the sent fields. Throws on a missing field.
+    self.token = function () {
+      if (account && !dirty) return "";
+      var out = {}, thieu = [];
+      form.fields.forEach(function (f) {
+        var v = val(f.key);
+        var can = f.required || (f.required_unless && !val(f.required_unless));
+        var w = host.querySelector('.ht-ftk[data-k="' + f.key + '"]');
+        if (can && !v && !(w && w.hidden)) thieu.push(f.label);
+        if (f.send && v) out[f.key] = v;
+      });
+      if (thieu.length) throw new Error(window.t("ht.form_thieu", { o: thieu.join(", ") }));
+      return JSON.stringify(out);
+    };
+    return self;
+  }
+
+  // Query string of the webhook-info call for a declared form (`webhook_params`: query param -> field key).
+  function thamSoWebhook(k, f) {
+    var wp = (k.form_tk && k.form_tk.webhook_params) || {};
+    return Object.keys(wp).map(function (q) {
+      var v = f ? f.value(wp[q]) : "";
+      return v ? "&" + encodeURIComponent(q) + "=" + encodeURIComponent(v) : "";
+    }).join("");
+  }
+
   async function moThemTK(opts) {
     opts = opts || {};
     // Gọi từ tab Chatbot thì sổ kênh có thể chưa nạp: không có nó thì modal hiện ra trống trơn.
@@ -2712,7 +2851,7 @@
     var kenhBot = _kenhDS.filter(function (k) { return k.kind === "bot"; });
     var kenhKhac = _kenhDS.filter(function (k) { return k.kind !== "bot"; });
     var chon = kenhBot.length ? kenhBot[0].id : "";
-    var uname = "", meta = {};
+    var uname = "", meta = {}, formTK = null;
     var box = el('<div class="ht-modal"><div class="ht-form">' +
       '<h3>' + esc(window.t("ht.them_tk")) + '</h3>' +
       '<label>' + esc(window.t("ht.lb_loai_kenh")) + '</label>' +
@@ -2731,6 +2870,7 @@
       '<div class="cb-hint ht-card-hint" id="htCardHint" hidden></div>' +
       '<div id="htTokenPart">' +
       '<label id="htTokenLabel"></label>' +
+      '<div id="htFormTK" hidden></div>' +
       '<div class="cb-row" id="htTokenRow"><input id="htToken" type="password" placeholder="' + esc(window.t("cb.ph_token")) + '">' +
         '<button class="s-btn-ghost" id="htCheck" type="button">' + esc(window.t("cb.kiem_tra")) + '</button></div>' +
       '<div class="cb-hint" id="htTokenNote"></div>' +
@@ -2768,7 +2908,15 @@
       if (g) lab.insertAdjacentHTML("beforeend", ' · <a class="ht-guide" href="' + esc(g) + '" target="_blank" rel="noopener">'
         + esc(window.t("ht.huong_dan")) + " ↗</a>");
       // Internal API (0.459.0): Javis generates the key on Save, so there is no token to paste or check.
-      box.querySelector("#htTokenRow").hidden = !!k.khoa_tu_sinh;
+      box.querySelector("#htTokenRow").hidden = !!k.khoa_tu_sinh || !!(k.form_tk && k.form_tk.fields);
+      // A declared form replaces the token box; the hint under it stays.
+      var fhost = box.querySelector("#htFormTK");
+      fhost.hidden = !(k.form_tk && k.form_tk.fields);
+      formTK = fhost.hidden ? null : veFormTK(fhost, k.form_tk, null, function (key) {
+        var wp = k.form_tk.webhook_params || {};
+        if (Object.keys(wp).some(function (q) { return wp[q] === key; })) hienWebhook(k);
+      });
+      if (!formTK) fhost.innerHTML = "";
       if (k.khoa_tu_sinh) lab.textContent = window.t("ht.khoa_lb");
       box.querySelector("#htTokenNote").textContent = (k.lay_token || "") + (k.khoa_tu_sinh ? "" : " " + window.t("cb.token_rieng"));
       // A channel with its own card on the Connections page (Messenger, 0.436.2): connecting there is quicker and a Page
@@ -2799,10 +2947,14 @@
       o.innerHTML = "";
       if (!k.webhook) return;
       try {
-        var r = await api("/channels/webhook-info?channel=" + encodeURIComponent(k.id));
+        var r = await api("/channels/webhook-info?channel=" + encodeURIComponent(k.id) + "&config_only=1" + thamSoWebhook(k, formTK));
         if (chon !== k.id) return;
         o.innerHTML = '<b>' + esc(window.t("ht.wh_url")) + '</b> <code>' + esc(r.webhook_url || "") + '</code>' +
           (r.verify_token ? '<br><b>' + esc(window.t("ht.wh_token")) + '</b> <code>' + esc(r.verify_token) + '</code>' : "") +
+          // Extra lines a channel's webhook_info hook adds (signature header, events to subscribe...).
+          (Array.isArray(r.extra) ? r.extra.map(function (x) {
+            return '<br><b>' + esc(x && x.label) + '</b> <code>' + esc(x && x.value) + '</code>';
+          }).join("") : "") +
           (r.https ? "" : '<br><span class="cb-warn">' + esc(window.t(r.site_verify ? "ht.zo_can_https" : "ht.wh_can_https")) + '</span>') +
           // A warning the server words itself, for a channel whose rule is not "HTTPS only" (WeChat: port 443 or 80).
           (r.warning ? '<br><span class="cb-warn">' + esc(r.warning) + '</span>' : "") +
@@ -2888,7 +3040,9 @@
       } catch (e) { note.innerHTML = '<span class="cb-warn">' + esc(e.message) + '</span>'; }
     };
     box.querySelector(".ht-save").onclick = async function () {
-      var t = box.querySelector("#htToken").value.trim();
+      var t;
+      try { t = formTK ? formTK.token() : box.querySelector("#htToken").value.trim(); }
+      catch (e) { return alert(e.message); }
       var k = kenhCua(chon);
       if (!chon) return alert(window.t("ht.khong_kenh_token"));
       if (!t && !k.khoa_tu_sinh) return alert(window.t("cb.dan_token_kenh", { kenh: k.nhan }) + "\n\n" + (k.lay_token || ""));
@@ -2970,22 +3124,28 @@
     };
   }
 
+  // Numeric account settings (`account_settings_spec`), shown on the edit form of any channel that declares them.
+  function caiDatTK(k, md) {
+    return (k.cai_dat_tk || []).map(function (f) {
+      var v = md[f.key] != null ? md[f.key] : f.default;
+      return '<label>' + esc(f.nhan) + '</label><input class="ht-cai-dat" type="number" inputmode="numeric" data-k="' +
+        esc(f.key) + '" min="' + esc(f.min) + '" max="' + esc(f.max) + '" value="' + esc(v) + '">';
+    }).join("");
+  }
+
   function moSuaTK(a) {
     var k = kenhCua(a.channel);
     var uname = "";
     var tuSinh = !!k.khoa_tu_sinh;
     var md = a.meta || {};
+    var coForm = !!(k.form_tk && k.form_tk.fields);
     // Generated-key channel: no token field, the key's first characters, a Rotate button and the account's limits.
-    var phanKhoa = tuSinh
+    // A channel with a declared form draws it here instead of the token box (filled from the saved account).
+    var phanKhoa = coForm ? '<div id="htFormTK"></div>' + caiDatTK(k, md) : tuSinh
       ? '<label>' + esc(window.t("ht.khoa_lb")) + '</label>' +
         '<div class="cb-row"><code id="htKhoaDau">' + esc((md.key_prefix || "") + "…") + '</code>' +
           '<button class="s-btn-ghost" id="htXoayKhoa" type="button">' + esc(window.t("ht.khoa_xoay")) + '</button></div>' +
-        '<div class="cb-hint">' + esc(window.t("ht.khoa_tran")) + '</div>' +
-        (k.cai_dat_tk || []).map(function (f) {
-          var v = md[f.key] != null ? md[f.key] : f.default;
-          return '<label>' + esc(f.nhan) + '</label><input class="ht-cai-dat" type="number" inputmode="numeric" data-k="' +
-            esc(f.key) + '" min="' + esc(f.min) + '" max="' + esc(f.max) + '" value="' + esc(v) + '">';
-        }).join("")
+        '<div class="cb-hint">' + esc(window.t("ht.khoa_tran")) + '</div>' + caiDatTK(k, md)
       : '<label>Token ' + esc(k.nhan) + ' ' + esc(window.t("cb.token_de_trong")) + '</label>' +
         '<div class="cb-row"><input id="htToken" type="password" placeholder="' + esc(window.t("cb.ph_token")) + '">' +
           '<button class="s-btn-ghost" id="htCheck" type="button">' + esc(window.t("cb.kiem_tra")) + '</button></div>' +
@@ -2994,7 +3154,7 @@
         (a.channel === "zalo_oa" ? '<div class="cb-hint ht-zo-oauth"><div>' +
           '<button class="s-btn-ghost" id="htZoOauth" type="button">' + esc(window.t("ht.zo_oauth_lai")) + '</button> ' +
           infoBtn() + '</div>' + infoBody(esc(window.t("ht.zo_oauth_lai_hd"))) +
-          '<div id="htZoOauthNote"></div></div>' : "");
+          '<div id="htZoOauthNote"></div></div>' : "") + caiDatTK(k, md);
     var box = el('<div class="ht-modal"><div class="ht-form">' +
       '<h3>' + esc(window.t("ht.sua_tk")) + ' - ' + esc(a.label) + '</h3>' +
       '<label>' + esc(window.t("ht.lb_nhan_tk")) + '</label>' +
@@ -3015,6 +3175,7 @@
         '<button class="s-btn ht-save" type="button">' + esc(window.t("common.save")) + '</button>' +
       '</div></div></div>');
     document.body.appendChild(box);
+    var formTK = coForm ? veFormTK(box.querySelector("#htFormTK"), k.form_tk, a) : null;
     var dong = function () { if (box.parentNode) box.parentNode.removeChild(box); };
     box.onmousedown = function (e) { if (e.target === box) dong(); };
     box.querySelector(".ht-close").onclick = dong;
@@ -3059,7 +3220,7 @@
         var oBr = box.querySelector("#htBrain");
         var oTok = box.querySelector("#htToken");
         var than = { label: box.querySelector("#htLabel").value.trim(),
-                     token: oTok ? oTok.value.trim() : "", bot_username: uname };
+                     token: formTK ? formTK.token() : (oTok ? oTok.value.trim() : ""), bot_username: uname };
         if (oBr) than.brain = oBr.value;   // không có ô (kind account) thì KHÔNG gửi = không đụng
         var oCd = box.querySelectorAll(".ht-cai-dat");
         if (oCd.length) {
