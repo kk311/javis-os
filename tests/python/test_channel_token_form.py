@@ -85,6 +85,16 @@ ui = channels.cho_giao_dien()
 check("4. channel list carries form_tk for every channel", ui and all("form_tk" in k for k in ui))
 
 js = (DASHBOARD / "conversations.js").read_text(encoding="utf-8")
+gf = channels._token_form(mod({"fields": [
+    {"key": "secret", "type": "password", "label": "S", "generate": True},
+    {"key": "plain", "type": "text", "label": "P", "generate": "yes"},
+    {"key": "pick", "type": "select", "label": "C", "generate": True,
+     "options": {"url": "/ext/demo-pack/x/y", "list": "items"}}]}))
+gk = {x["key"]: x for x in gf["fields"]}
+check("3. generate kept on a password field", gk["secret"].get("generate") is True)
+check("3. generate must be exactly true", "generate" not in gk["plain"])
+check("3. generate ignored on a select", "generate" not in gk["pick"])
+
 check("5. renderer exists", "function veFormTK(host, form, account, onChange)" in js)
 check("5. add form uses it", "formTK = fhost.hidden ? null : veFormTK(fhost, k.form_tk, null" in js)
 check("5. edit form uses it", "veFormTK(box.querySelector(\"#htFormTK\"), k.form_tk, a)" in js)

@@ -2732,8 +2732,13 @@
             esc(f.options.button || window.t("ht.form_tai")) + '</button>' : "") + '</div>' +
           '<div class="cb-hint" data-st="' + esc(f.key) + '" role="status"></div>';
       } else {
-        o += '<input id="' + id + '" type="' + (f.type === "password" ? "password" : "text") +
+        var inp = '<input id="' + id + '" type="' + (f.type === "password" ? "password" : "text") +
           '" autocomplete="off" value="' + esc(dau(f)) + '">';
+        // `generate`: the value is a secret WE make (e.g. a webhook secret pasted into the provider's settings).
+        o += f.generate ? '<div class="cb-row">' + inp +
+          '<button type="button" class="s-btn-ghost" data-gen="' + esc(f.key) + '">' + esc(window.t("ht.form_tao")) + '</button>' +
+          '<button type="button" class="s-btn-ghost" data-copy="' + esc(f.key) + '">' + esc(window.t("ht.form_chep")) + '</button>' +
+          '</div><div class="cb-hint" data-st="' + esc(f.key) + '" role="status"></div>' : inp;
       }
       return o + '</div>';
     }).join("");
@@ -2814,6 +2819,21 @@
         if (!f.options.from.length) tai(f, true);
       } else {
         n.oninput = function () { dirty = true; an(); doi(f.key); };
+        var bg = f.generate && host.querySelector('[data-gen="' + f.key + '"]');
+        if (bg) bg.onclick = function () {
+          var b = new Uint8Array(32);
+          (window.crypto || globalThis.crypto).getRandomValues(b);
+          n.value = Array.prototype.map.call(b, function (x) { return ("0" + x.toString(16)).slice(-2); }).join("");
+          n.type = "text";          // shown, so the owner can copy it into the provider's settings
+          status(f.key, window.t("ht.form_da_tao"));
+          n.oninput();
+        };
+        var bc = f.generate && host.querySelector('[data-copy="' + f.key + '"]');
+        if (bc) bc.onclick = async function () {
+          if (!n.value) { status(f.key, window.t("ht.form_chua_co")); return; }
+          try { await navigator.clipboard.writeText(n.value); status(f.key, window.t("ht.form_da_chep")); }
+          catch (e) { n.type = "text"; if (n.select) n.select(); status(f.key, window.t("ht.form_chep_tay")); }
+        };
       }
     });
     an();

@@ -61,7 +61,7 @@ function makeHost() {
     let m;
     if ((m = /^#(.+)$/.exec(q))) return host.nodes.find((n) => n.id === m[1]) || null;
     if ((m = /^\.ht-ftk\[data-k="(.+)"\]$/.exec(q))) return host.nodes.find((n) => n.cls === "ht-ftk" && n.dataset.k === m[1]) || null;
-    if ((m = /^\[data-(st|load)="(.+)"\]$/.exec(q))) return host.nodes.find((n) => n.dataset[m[1]] === m[2]) || null;
+    if ((m = /^\[data-(st|load|gen|copy)="(.+)"\]$/.exec(q))) return host.nodes.find((n) => n.dataset[m[1]] === m[2]) || null;
     return null;
   };
   return host;
@@ -75,7 +75,7 @@ const replies = {
   "/ext/p/accounts": { accounts: [{ id: "acc9", username: "shop", platform: "instagram" }] },
 };
 const api = async (url, opts) => { calls.push({ url, opts }); return replies[url]; };
-const window = { t: (k, v) => k + (v ? ":" + JSON.stringify(v) : "") };
+const window = { t: (k, v) => k + (v ? ":" + JSON.stringify(v) : ""), crypto: require("crypto").webcrypto };
 const esc = (s) => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
 const fd = (o) => ({ form: o });
 const veFormTK = new Function("api", "fd", "esc", "window", "infoBtn", "infoBody",
@@ -90,7 +90,7 @@ const FORM = { fields: [
                from: ["connection_id", "api_key"], fill: { account_id: "id", username: "username" }, auto_single: false } },
   { key: "account_id", type: "text", label: "Account ID", send: true, required: true, initial: "meta.account_id" },
   { key: "username", type: "text", label: "Username", send: true, required: true, initial: "external_id" },
-  { key: "secret", type: "password", label: "Secret", send: true, required: false },
+  { key: "secret", type: "password", label: "Secret", send: true, required: false, generate: true },
 ] };
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
@@ -138,6 +138,28 @@ const tick = () => new Promise((r) => setTimeout(r, 0));
   const t2 = JSON.parse(g.token());
   check("5. changing only the secret keeps the workspace", t2.connection_id === "ws1" && t2.secret === "new" && t2.account_id === "acc9",
         JSON.stringify(t2));
+
+  // ---- Generated secret ----
+  const h3 = makeHost();
+  const k3 = veFormTK(h3, FORM, null);
+  await tick(); await tick();
+  const s3 = h3.querySelector("#htF_secret");
+  check("6. generate button drawn", !!h3.querySelector('[data-gen="secret"]') && !!h3.querySelector('[data-copy="secret"]'));
+  check("6. no generate button on plain fields", !h3.querySelector('[data-gen="account_id"]'));
+  h3.querySelector('[data-gen="secret"]').onclick();
+  const v1 = s3.value;
+  check("6. 64 hex chars", /^[0-9a-f]{64}$/.test(v1), v1);
+  check("6. shown after generating", s3.type === "text");
+  h3.querySelector('[data-gen="secret"]').onclick();
+  check("6. a new value each press", s3.value !== v1 && /^[0-9a-f]{64}$/.test(s3.value));
+  h3.querySelector("#htF_account_id").value = "a"; h3.querySelector("#htF_username").value = "u";
+  check("6. generated secret is sent", JSON.parse(k3.token()).secret === s3.value);
+  // Edit: generating marks the form dirty, so a rotated secret is posted.
+  const h4 = makeHost();
+  const k4 = veFormTK(h4, FORM, { external_id: "shop", meta: { account_id: "acc9", connection_id: "ws1" } });
+  await tick(); await tick();
+  h4.querySelector('[data-gen="secret"]').onclick();
+  check("6. edit + generate posts the new secret", JSON.parse(k4.token()).secret === h4.querySelector("#htF_secret").value);
 
   console.log("\n" + (fails.length ? fails.length + " FAIL" : "ALL OK"));
   process.exit(fails.length ? 1 : 0);

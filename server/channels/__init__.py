@@ -378,6 +378,7 @@ def cho_giao_dien() -> List[dict]:
 #   {"fields": [{"key": "account_id", "type": "text" | "password" | "select", "label": str | {"vi","en"},
 #                "hint": ..., "required": bool, "required_unless": "<other key>", "hidden_when": "<other key>",
 #                "send": bool (default True), "initial": "external_id" | "meta.<key>",
+#                "generate": bool (text/password only: Generate + Copy buttons, a random 64-hex-char secret),
 #                "options": {"url": "/ext/<slug>/<path>", "list": "<array key>", "value": "<item key>",
 #                            "label": "@{username} ({platform})", "empty": label, "from": ["<keys>"],
 #                            "fill": {"<field key>": "<item key>"}, "button": label, "auto_single": bool}}],
@@ -415,6 +416,8 @@ def _token_form(m) -> dict:
             o = {"key": f["key"], "type": f["type"], "label": _form_chu(f.get("label"), 120) or f["key"],
                  "hint": _form_chu(f.get("hint")), "required": bool(f.get("required")),
                  "send": f.get("send", True) is not False}
+            if f["type"] in ("text", "password") and f.get("generate") is True:
+                o["generate"] = True     # dashboard adds Generate + Copy (a random 256-bit hex value)
             for k in ("required_unless", "hidden_when"):
                 if _form_khoa(f.get(k)):
                     o[k] = f[k]
