@@ -92,6 +92,29 @@ check("hòm thư phân tích ảnh cho mọi tin không phải chữ, không ch�
 const cr = fs.readFileSync(path.join(__dirname, "../../dashboard/chat-render.js"), "utf8");
 check("lightbox mở ảnh trang khác không gửi referrer (CDN Zalo chặn)", /img\.referrerPolicy = "no-referrer"/.test(cr));
 
+// ---- 8. metadata.link: a channel that only has a LINK to the media (story, reel, a shared post) ----
+const STORY = "https://lookaside.fbsbx.com/ig_messaging_cdn/?asset_id=1&signature=x";
+let lk = M.phanTich({ sender_type: "customer", message_type: "image", text: "[Story]",
+  metadata: { link: { url: STORY, title: "Story", subtitle: "Khach tra loi story" } } }, "c1");
+check("link: the link card carries url, title, subtitle", lk.lien && lk.lien.href === STORY && lk.lien.ten === "Story"
+  && lk.lien.phu === "Khach tra loi story" && !lk.anh && !lk.file, JSON.stringify(lk));
+check("link: the bracket label is not shown as a caption", lk.chu === "", lk.chu);
+h = M.html(lk, esc, ic, tw);
+check("link: drawn as a card opening a new tab, never a download",
+  h.indexOf('class="ht-file ht-lien"') > 0 && h.indexOf("target=\"_blank\"") > 0 && h.indexOf(" download") < 0 && h.indexOf("<i link>") > 0, h);
+check("link: url and texts are escaped", M.html({ lien: { href: "https://a.b/?x=\"><", ten: "<b>", phu: "" } }, esc, ic, tw).indexOf("<b>") < 0);
+lk = M.phanTich({ message_type: "video", text: "[Reel] Mau moi", metadata: { link: { url: "https://cdn.example.com/r.mp4" } } });
+check("link: no title falls back to the host, the real caption stays", lk.lien.ten === "cdn.example.com" && lk.chu === "[Reel] Mau moi", JSON.stringify(lk));
+for (const bad of ["http://x.com/a", "javascript:alert(1)", "//x.com/a", "", null]) {
+  const r = M.phanTich({ message_type: "other", text: "[Dinh kem]", metadata: { link: { url: bad, title: "x" } } });
+  check("link: refuses a non-https url " + JSON.stringify(bad), r.lien === null, JSON.stringify(r));
+}
+lk = M.phanTich({ message_type: "image", text: "x", metadata: { image_url: ZL, link: { url: STORY } } });
+check("link: an image wins over a link", lk.anh === ZL && lk.lien === null);
+lk = M.phanTich({ message_type: "other", text: "", metadata: { link: { url: STORY, title: "a".repeat(300) } } });
+check("link: a long title is clipped", lk.lien.ten.length <= 83, lk.lien.ten.length);
+check("hop thu ve the link nhu media", /var coMedia = !!\(media && \(media\.anh \|\| media\.file \|\| media\.lien\)\);/.test(cv));
+
 console.log();
 if (fails.length) {
   console.log("ĐỎ " + fails.length + " mục: " + fails.join(", "));

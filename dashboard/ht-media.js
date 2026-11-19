@@ -5,6 +5,8 @@
 
    Hai nguon, deu da co san trong tin, giao dien truoc day bo qua:
      - Zalo ca nhan luu LINK: metadata.image_url (anh) va metadata.attachment {url, name, size} (file).
+     - Kenh nao chi co LINK toi media (story, reel, bai dang tren mang xa hoi; link CDN co the het han) ghi
+       metadata.link {url, title, subtitle}: hien thanh the link, khong tai ve may. Chi nhan https.
      - Cac kenh bot con lai (Telegram, Zalo Bot, Slack, WhatsApp, Messenger, Discord, Lark) TAI VE brain cua
        bot roi ghi mot dong "[... da tai ve: <duong dan>]" vao tin. File do di qua
        /conversations/<id>/media, duong may chu tu kiem file nam trong inbox/ hoac attachments/ cua brain.
@@ -33,6 +35,13 @@
     return (n / 1048576).toFixed(1) + " MB";
   }
 
+  function rutGon(s, n) {
+    s = String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+    return s.length > n ? s.slice(0, n).replace(/\s+\S*$/, "") + "..." : s;
+  }
+
+  function tenMien(u) { var m = /^https:\/\/([^\/?#]+)/i.exec(u); return m ? m[1] : u; }
+
   // Phan chu that cua nguoi gui: bo dong tai ve; bo luon chu "nen" (link anh tran, "[chat.photo]",
   // "[Zalo ca nhan: khach gui image]") vi do khong phai loi khach noi.
   function chuThich(text) {
@@ -55,7 +64,7 @@
       return "/conversations/" + encodeURIComponent(String(cid || t.conversation_id || "")) +
         "/media?p=" + encodeURIComponent(p) + (taiVe ? "&dl=1" : "");
     };
-    var ra = { anh: "", file: null, chu: chuThich(text) };
+    var ra = { anh: "", file: null, lien: null, chu: chuThich(text) };
     if (loai === "image" || (duong && DUOI_ANH.test(duong))) {
       if (laHttps(md.image_url)) ra.anh = String(md.image_url).trim();
       else if (duong) ra.anh = quaMay(duong, false);
@@ -69,6 +78,11 @@
       ra.file = { href: quaMay(duong, true), ten: tenFile(duong), coDung: "" };
     }
     if (ra.file && ra.chu === ra.file.ten) ra.chu = "";
+    var ln = md.link && typeof md.link === "object" ? md.link : null;
+    if (!ra.file && ln && laHttps(ln.url)) {
+      var href = String(ln.url).trim();
+      ra.lien = { href: href, ten: rutGon(ln.title, 80) || tenMien(href), phu: rutGon(ln.subtitle, 160) };
+    }
     return ra;
   }
 
@@ -81,8 +95,14 @@
         ' onerror="this.parentNode.classList.add(\'hong\')">' +
         '<span class="ht-anh-hong">' + ic("image") + " " + esc(tw("ht.anh_hong")) + "</span></a>";
     }
+    if (pt.lien) {
+      return '<a class="ht-file ht-lien" href="' + esc(pt.lien.href) + '" target="_blank" rel="noopener noreferrer">' +
+        '<span class="ht-file-ico">' + ic("link") + "</span>" +
+        '<span class="ht-file-info"><span class="ht-file-ten">' + esc(pt.lien.ten) + "</span>" +
+        (pt.lien.phu ? '<span class="ht-file-meta">' + esc(pt.lien.phu) + "</span>" : "") + "</span></a>";
+    }
     if (pt.file) {
-      return '<a class="ht-file" href="' + esc(pt.file.href) + '" target="_blank" rel="noopener noreferrer" download>' +
+      return '<a class="ht-file" href=""' + esc(pt.file.href) + '" target="_blank" rel="noopener noreferrer" download>' +
         '<span class="ht-file-ico">' + ic("paperclip") + "</span>" +
         '<span class="ht-file-info"><span class="ht-file-ten">' + esc(pt.file.ten) + "</span>" +
         '<span class="ht-file-meta">' + (pt.file.coDung ? esc(pt.file.coDung) + " · " : "") + esc(tw("ht.tai_ve")) + "</span></span>" +
