@@ -4117,7 +4117,7 @@
   "ht.form_dang_tai": "Đang tải...",
   "ht.form_tao": "Tạo",
   "ht.form_chep": "Chép",
-  "ht.form_da_tao": "Đã tạo secret mới. Bấm Chép rồi dán vào trang cài đặt webhook của nhà cung cấp, sau đó lưu tài khoản.",
+  "ht.form_da_tao": "Đã tạo secret mới. Chép rồi dán vào cài đặt webhook của nhà cung cấp, sau đó lưu tài khoản.",
   "ht.form_da_chep": "Đã chép.",
   "ht.form_chua_co": "Chưa có gì để chép, bấm Tạo trước.",
   "ht.form_chep_tay": "Không chép tự động được, hãy bôi đen và chép tay.",
