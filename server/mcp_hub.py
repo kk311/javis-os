@@ -225,6 +225,20 @@ OWNER_ONLY_TOOLS = frozenset({"javis_reply_policy", "javis_reply_policy_tune", "
                               "javis_add_mcp"})
 
 
+# 2026-11-20: what a customer-facing bot must not have even though the owner's sessions do. Not in OWNER_ONLY_TOOLS on
+# purpose: that set lists tools every owner session HAS (tests assert it), and the Zernio tools only exist where the
+# owner installed that plugin. A bot at the "auto" level otherwise gets the vault file tools (the whole brain, raw
+# customer notes included) and every plugin tool, `zernio_conversations` / `zernio_messages` among them, which read
+# OTHER customers' chats. A bot that needs documents uses the "read_docs" level or the pre-turn search.
+BOT_CAM_HUB_TOOLS = frozenset({"javis_read_file", "javis_list_dir", "javis_search_files"})
+BOT_CAM_HUB_PREFIX = ("zernio_",)     # also matches the connection tool zernio__accounts_list
+
+
+def bot_cam_hub(fn) -> bool:
+    fn = str(fn or "")
+    return fn in BOT_CAM_HUB_TOOLS or fn.startswith(BOT_CAM_HUB_PREFIX)
+
+
 # ============================================================
 # Audit
 # ============================================================
@@ -2390,6 +2404,9 @@ async def discover_all(mode="full", vault_root=None, include_plugins=True, inclu
     if for_bot:
         tools_spec = [t for t in tools_spec if t.get("fn") not in OWNER_ONLY_TOOLS]
         for fn in OWNER_ONLY_TOOLS:
+            route.pop(fn, None)
+        tools_spec = [t for t in tools_spec if not bot_cam_hub(t.get("fn"))]
+        for fn in [f for f in route if bot_cam_hub(f)]:
             route.pop(fn, None)
 
     # Snapshot ĐẦY ĐỦ trước lazy cho Capability Registry Phase 2. Registry chỉ dùng metadata;
