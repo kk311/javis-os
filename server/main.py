@@ -4698,7 +4698,8 @@ def _claude_sub_stream_tools(model, messages, reasoning="off", *, brain=None, ta
     cli.mcp_config = mcp_hub.claude_config_path(mode, vault_root=vault, bot=True)
     cli.mcp_strict = cli.mcp_config is not None
     # Lớp hai cho OWNER_ONLY_TOOLS (0.77.0): hub đã giấu nhờ header X-Javis-Bot, chặn thêm ở đây phòng hub đổi.
-    cli.disallowed_tools = list(BOT_CAM_NATIVE) + [f"mcp__javis__{t}" for t in sorted(mcp_hub.OWNER_ONLY_TOOLS)]
+    cli.disallowed_tools = list(BOT_CAM_NATIVE) + [f"mcp__javis__{t}" for t in sorted(
+        mcp_hub.OWNER_ONLY_TOOLS | mcp_hub.BOT_CAM_HUB_TOOLS)]
     return _claude_sub_doc(cli, _claude_kem_anh(messages, _cli_do_sau(cli, reasoning, prompt)), model)
 
 
