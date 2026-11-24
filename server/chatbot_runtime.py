@@ -2588,7 +2588,11 @@ async def manual_answer(conv: dict, msgs: list, draft: bool = False, instruction
                  else VIDEO_TRON if (last or {}).get("message_type") == "video"
                  else AUDIO_TRON if (last or {}).get("message_type") == "audio"
                  else str((last or {}).get("text") or "").strip())
-    if (not last or not chu_khach) and not lenh:
+    # A channel pack can interpret a media-only turn and its preceding customer burst.
+    # Other channels retain their existing input preparation and no-message behavior.
+    channel_module = channels.module(str(conv.get("channel") or ""))
+    prepare_manual = getattr(channel_module, "prepare_manual_reply", None)
+    if (not last or not chu_khach) and not lenh and not (last and callable(prepare_manual)):
         return {"ok": False, "code": "no_message", "error": localefmt.chu("Chưa có tin khách để trả lời",
                                                                           "No customer message to reply to yet")}
     if not last:
@@ -2611,6 +2615,27 @@ async def manual_answer(conv: dict, msgs: list, draft: bool = False, instruction
         except Exception as e:      # noqa: BLE001 - không đọc được phiên thì nháp không có ngữ cảnh kho, vẫn chạy
             print(f"[chatbot {bot_id}] đọc phiên cho bản nháp lỗi: {type(e).__name__}", file=sys.stderr)
     try:
+        prepared_media = False
+        if callable(prepare_manual):
+            await stage("image")
+            prepared = await prepare_manual(conv, msgs)
+            if prepared is not None:
+                if not isinstance(prepared, dict) or not prepared.get("handled"):
+                    raise ValueError("invalid manual input from channel")
+                if not prepared.get("ok"):
+                    return {"ok": False, "code": prepared.get("code") or "media_unavailable",
+                            "error": prepared.get("error") or localefmt.chu(
+                                "Kênh chưa đọc được ảnh của khách", "The channel could not read the customer's media")}
+                chu_khach = str(prepared.get("text") or "").strip()
+                if not chu_khach:
+                    raise ValueError("empty manual input from channel")
+                prepared_media = True
+                # The pack has already interpreted the images; do not download or read twice.
+                for field in ("co_anh", "image_url", "image_path", "video_url", "audio_urls"):
+                    meta.pop(field, None)
+        if not chu_khach and not lenh:
+            return {"ok": False, "code": "no_message", "error": localefmt.chu(
+                "Chưa có tin khách để trả lời", "No customer message to reply to yet")}
         text = chu_khach or lenh
         _aid, kenh = _tai_khoan_cua(cfg, meta)
         cfg["_kenh_luot"], cfg["_tu_dong"] = kenh, False
@@ -2628,7 +2653,7 @@ async def manual_answer(conv: dict, msgs: list, draft: bool = False, instruction
         # them together, the owner waits for the slowest instead of the sum (owner 2026-11-18: "A.I. viết" felt slow).
         tl, cfg["_ngu_canh_plugin"], (text_engine, cfg["_anh"]) = await asyncio.gather(
             _tra_tai_lieu(bot_id, cfg, text, meta["chat_id"]), plugin_context(cfg, meta, kenh, _aid),
-            anh_cho_bot(text_engine, meta, cfg) if chu_khach else no_media())
+            anh_cho_bot(text_engine, meta, cfg) if chu_khach and not prepared_media else no_media())
         cfg["_tai_lieu"] = tl
         if lenh:
             # In the system prompt (strongest place) AND after the customer's words (the last thing read).
